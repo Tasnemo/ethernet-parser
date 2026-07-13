@@ -93,7 +93,7 @@ let create _scope ({ clock; reset; input_data; input_valid; input_start; input_l
                 [ payload_data <-- input_data
                 ; payload_valid <--. 1
                 ; payload_last <-- input_last
-                ; when_ input_last [ sm.set_next Idle ]
+                ; when_ input_last [ payload_valid <--. 1; payload_last <--. 1; sm.set_next Idle ]
                 ]
             ] )
         ]
