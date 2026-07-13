@@ -31,16 +31,20 @@ end
 
 let create _scope ({ payload_data; payload_valid; payload_last; ethertype; ethernet_header_valid } : _ I.t) : _ O.t =
   let open Signal in
-  { is_ipv4 = gnd
-  ; is_udp = gnd
+  let is_ipv4 = ethernet_header_valid &: (ethertype ==:. 0x0800) in
+  let is_udp = is_ipv4 &: payload_valid in
+  let packet_valid = is_ipv4 &: payload_valid in
+  let malformed = ethernet_header_valid &: (~: is_ipv4) in
+  { is_ipv4
+  ; is_udp
   ; source_ip = zero 32
   ; destination_ip = zero 32
   ; ip_protocol = zero 8
   ; source_port = zero 16
   ; destination_port = zero 16
   ; udp_length = zero 16
-  ; packet_valid = gnd
-  ; malformed = gnd
+  ; packet_valid
+  ; malformed
   }
 ;;
 
