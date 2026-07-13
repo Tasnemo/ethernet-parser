@@ -58,6 +58,9 @@ let create _scope ({ clock; reset; input_data; input_valid; input_start; input_l
                 [ byte_count <--. 0
                 ; header_valid <--. 0
                 ; malformed <--. 0
+                ; payload_valid <--. 0
+                ; payload_last <--. 0
+                ; payload_data <--. 0
                 ; sm.set_next Header
                 ]
             ] )
