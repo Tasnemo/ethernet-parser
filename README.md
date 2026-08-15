@@ -1,6 +1,12 @@
 # hardcaml-packet-engine
 
-This repository is a beginner-friendly Hardcaml + Cocotb packet parser scaffold. The first milestone is an Ethernet parser that captures the 14-byte Ethernet header, forwards payload bytes, and exposes header validity and malformed status.
+This repository is an extremely Hardcaml + Cocotb packet parser scaffold. 
+
+## Milestones
+
+1. The first milestone is an Ethernet parser that captures the 14-byte Ethernet header, forwards payload bytes, and exposes header validity and malformed status.
+2. Then would be to add IPv4 parsing so the design can pull out the main header fields, check the basic packet structure, and pass the payload into the next stage.
+3. After that, add UDP parsing for the source and destination ports, packet length, and payload so the full Ethernet to IPv4 to UDP path works end to end.
 
 ## Current scope
 
