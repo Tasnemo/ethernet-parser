@@ -21,6 +21,14 @@ output logic sof,
 input logic rx_error
 output logic ether_error
 );
+typedef enum logic[2:0] {IDLE, DEST_MAC, SOUR_MAC. ETHER_TYPE,  PAYLOAD, FCS  } protocol_stages
+protocol_stages read;
 
 
+always_ff begin
+    if(rst) then 
+        read <= IDLE;
+        
+
+end
 endmodule
