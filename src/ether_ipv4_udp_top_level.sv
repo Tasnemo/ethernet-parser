@@ -1,11 +1,12 @@
 module full_parser (
-input logic clk,
+input logic rx_clk,
 input logic rst,
 
-// GMII output pins
-input logic[7:0] gmii_rxd,
-input logic gmii_rx_dv,
-input logic gmii_rx_er,
+// GMII input interface
+input logic[7:0] rxd,
+input logic rx_dv,
+input logic rx_er,
+
 
 // parser feedback
 output logic parser_valid,
