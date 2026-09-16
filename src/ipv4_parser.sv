@@ -1,4 +1,4 @@
-module ipv4_parser_v01 #(
+module ipv4_parser (
     parameter int MAX_IPV4_BYTES = 1500
 ) (
     input logic clk,
@@ -35,35 +35,76 @@ module ipv4_parser_v01 #(
     } protocol_stage_t;
 
     protocol_stage_t read;
+    logic [4:0] header_count;
+    logic first_header_byte;
+    logic header_byte_active;
+    logic packet_context;
+
+    assign first_header_byte = (read == IDLE) && data_start && data_valid;
+    assign header_byte_active = first_header_byte
+                              || ((read == HEADER) && data_valid);
+    assign packet_context = (read != IDLE) || first_header_byte;
+
+    assign o_stream = data;
+    assign header_ipv4_valid = header_byte_active;
+    assign total_length_valid = 1'b0;
+    assign protocol_valid = 1'b0;
+    assign source_ip_valid = 1'b0;
+    assign destination_ip_valid = 1'b0;
+    assign payload_ipv4_valid = (read == PAYLOAD) && data_valid;
+
+    assign start_of_packet = first_header_byte;
+    assign end_of_payload = 1'b0;
+    assign end_of_packet = data_end && packet_context;
+
+    assign header_checksum_error = 1'b0;
+    assign ipv4_error = 1'b0;
 
     always_ff @(posedge clk) begin
         if (rst) begin
             read <= IDLE;
+            header_count <= 5'd0;
+        end else if (data_end) begin
+            read <= IDLE;
+            header_count <= 5'd0;
         end else begin
             case (read)
-                IDLE,
-                HEADER,
-                PAYLOAD,
-                WAIT_END,
-                DROP: read <= read;
-                default: read <= IDLE;
+                IDLE: begin
+                    header_count <= 5'd0;
+                    if (data_start && data_valid) begin
+                        read <= HEADER;
+                        header_count <= 5'd1;
+                    end
+                end
+
+                HEADER: begin
+                    if (data_valid) begin
+                        if (header_count == 5'd19) begin
+                            read <= PAYLOAD;
+                        end else begin
+                            header_count <= header_count + 5'd1;
+                        end
+                    end
+                end
+
+                PAYLOAD: begin
+                    read <= PAYLOAD;
+                end
+
+                WAIT_END: begin
+                    read <= WAIT_END;
+                end
+
+                DROP: begin
+                    read <= DROP;
+                end
+
+                default: begin
+                    read <= IDLE;
+                    header_count <= 5'd0;
+                end
             endcase
         end
-    end
-
-    always_comb begin
-        o_stream = 8'h00;
-        header_ipv4_valid = 1'b0;
-        total_length_valid = 1'b0;
-        protocol_valid = 1'b0;
-        source_ip_valid = 1'b0;
-        destination_ip_valid = 1'b0;
-        payload_ipv4_valid = 1'b0;
-        start_of_packet = 1'b0;
-        end_of_payload = 1'b0;
-        end_of_packet = 1'b0;
-        header_checksum_error = 1'b0;
-        ipv4_error = 1'b0;
     end
 
 endmodule
