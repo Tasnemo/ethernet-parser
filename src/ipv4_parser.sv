@@ -1,4 +1,5 @@
-module ipv4_parser_v05 #(
+
+module ipv4_parser (
     parameter int MAX_IPV4_BYTES = 1500
 ) (
     // clock and reset
@@ -57,16 +58,20 @@ module ipv4_parser_v05 #(
     logic [7:0] length_high;
     logic [LENGTH_WIDTH-1:0] bytes_remaining;
 
-    // header entities
+    // current byte checks
     logic packet_context;
     logic header_byte_active;
     logic [15:0] length_candidate;
     logic version_ihl_error_now;
     logic length_error_now;
     logic structural_error_now;
-    logic discard_now;
+    logic upstream_error_now;
+    logic payload_complete_now;
+    logic truncation_error_now;
+    logic packet_error_now;
+    logic output_abort;
 
-    // parameter check
+    // keep the configured size inside the ipv4 length field
     generate
         if ((MAX_IPV4_BYTES < IPV4_HEADER_BYTES)
             || (MAX_IPV4_BYTES > 65535)) begin : invalid_max_ipv4_bytes
@@ -74,6 +79,7 @@ module ipv4_parser_v05 #(
         end
     endgenerate
 
+    // output stream
     assign o_stream = data;
 
     // header entities
@@ -81,16 +87,14 @@ module ipv4_parser_v05 #(
     assign header_byte_active = data_valid
                               && (((stage == IDLE) && data_start)
                                || (stage == HEADER));
-    // total length checks
-    // total length joins on byte 3
     assign length_candidate = {length_high, data};
 
-    // version and ihl check on byte 0
+    // version and ihl on byte 0
     assign version_ihl_error_now = (stage == IDLE) && data_start && data_valid
                                  && ((data[7:4] != 4'h4)
                                   || (data[3:0] != 4'h5));
 
-    // total length check on byte 3
+    // total length ends on byte 3
     assign length_error_now = (stage == HEADER) && data_valid
                             && (header_index == 5'd3)
                             && ((length_candidate < 16'd20)
@@ -98,40 +102,57 @@ module ipv4_parser_v05 #(
 
     assign structural_error_now = version_ihl_error_now || length_error_now;
 
-    // drop stage holds the error through the packet
-    assign discard_now = (stage == DROP) || structural_error_now;
-    assign ipv4_error = discard_now;
+    // legal end on byte 19 with no payload or on the last payload byte
+    assign payload_complete_now = ((stage == PAYLOAD) && data_valid
+                                && (bytes_remaining == 1))
+                               || ((stage == HEADER) && data_valid
+                                && (header_index == 5'd19)
+                                && (bytes_remaining == 0));
+
+    // pass stream errors through anywhere inside the packet
+    assign upstream_error_now = packet_context && data_error;
+    // early data_end means truncated packet
+    assign truncation_error_now = data_end && packet_context
+                                && (stage != WAIT_END) && (stage != DROP)
+                                && !payload_complete_now;
+
+    assign packet_error_now = structural_error_now
+                            || upstream_error_now
+                            || truncation_error_now;
+
+    // earlier bytes stay speculative and later bytes stop on error
+    assign output_abort = (stage == DROP) || upstream_error_now;
+    assign ipv4_error = (stage == DROP) || packet_error_now;
 
     // packet framing signals
     assign start_of_packet = data_start && data_valid;
     assign end_of_packet = data_end && packet_context;
 
     // field windows
-    assign header_ipv4_valid = header_byte_active && !discard_now; // bytes 0-19
+    assign header_ipv4_valid = header_byte_active && !output_abort;
     assign total_length_valid = header_ipv4_valid && (stage == HEADER)
                               && ((header_index == 5'd2)
                                || (header_index == 5'd3)); // bytes 2-3
     assign protocol_valid = header_ipv4_valid && (stage == HEADER)
-                          && (header_index == 5'd9); // byte 9
+                          && (header_index == 5'd9);       // byte 9
     assign source_ip_valid = header_ipv4_valid && (stage == HEADER)
                            && (header_index >= 5'd12)
-                           && (header_index <= 5'd15); // bytes 12-15
+                           && (header_index <= 5'd15);     // bytes 12-15
     assign destination_ip_valid = header_ipv4_valid && (stage == HEADER)
                                 && (header_index >= 5'd16)
                                 && (header_index <= 5'd19); // bytes 16-19
     assign payload_ipv4_valid = (stage == PAYLOAD) && data_valid
-                              && (bytes_remaining != 0) && !discard_now;
+                              && (bytes_remaining != 0) && !output_abort;
 
-    assign end_of_payload = !discard_now
+    assign end_of_payload = !output_abort
                           && ((payload_ipv4_valid && (bytes_remaining == 1))
                            || ((stage == HEADER) && data_valid
                             && (header_index == 5'd19)
                             && (bytes_remaining == 0)));
 
-    // no checksum check
     assign header_checksum_error = 1'b0;
 
-// parsing process
+    // parsing process
     always_ff @(posedge clk) begin
         if (rst) begin
             stage           <= IDLE;
@@ -146,7 +167,6 @@ module ipv4_parser_v05 #(
                     bytes_remaining <= '0;
 
                     if (data_start && data_valid) begin
-                        // byte 0 starts the header
                         header_index <= 5'd1;
                         if (version_ihl_error_now) begin
                             stage <= DROP;
@@ -161,19 +181,16 @@ module ipv4_parser_v05 #(
                 HEADER: begin
                     if (data_valid) begin
                         if (header_index == 5'd2) begin
-                            // total length high byte
                             length_high <= data;
                         end
 
                         if ((header_index == 5'd3) && !length_error_now) begin
-                            // total length low byte
                             bytes_remaining <= length_candidate - 16'd20;
                         end
 
                         if (length_error_now) begin
                             stage <= DROP;
                         end else if (header_index == 5'd19) begin
-                            // byte 19 ends the header
                             if (bytes_remaining == 0) begin
                                 stage <= WAIT_END;
                             end else begin
@@ -187,7 +204,6 @@ module ipv4_parser_v05 #(
 
                 PAYLOAD: begin
                     if (data_valid) begin
-                        // count only accepted stream bytes
                         if (bytes_remaining > 1) begin
                             bytes_remaining <= bytes_remaining - 1'b1;
                         end else begin
@@ -198,19 +214,24 @@ module ipv4_parser_v05 #(
                 end
 
                 WAIT_END: begin
-                    // drain link layer padding
+                    // ignore ethernet padding after ipv4 payload
                     stage <= WAIT_END;
                 end
 
                 DROP: begin
-                    // hold structural error until frame end
+                    // hold error through the packet boundary
                     stage <= DROP;
                 end
 
                 default: stage <= IDLE;
             endcase
 
-            // frame boundary reset
+            // pass stream or truncation error to drop
+            if (packet_error_now) begin
+                stage <= DROP;
+            end
+
+            // packet boundary has final priority
             if (data_end && packet_context) begin
                 stage           <= IDLE;
                 header_index    <= '0;
@@ -219,7 +240,5 @@ module ipv4_parser_v05 #(
             end
         end
     end
-
-    // upstream error not checked
 
 endmodule
