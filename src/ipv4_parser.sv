@@ -1,4 +1,3 @@
-
 module ipv4_parser (
     parameter int MAX_IPV4_BYTES = 1500
 ) (
@@ -64,6 +63,7 @@ module ipv4_parser (
     logic [15:0] length_candidate;
     logic version_ihl_error_now;
     logic length_error_now;
+    logic fragment_error_now;
     logic structural_error_now;
     logic upstream_error_now;
     logic payload_complete_now;
@@ -100,7 +100,16 @@ module ipv4_parser (
                             && ((length_candidate < 16'd20)
                              || (length_candidate > MAX_IPV4_VALUE));
 
-    assign structural_error_now = version_ihl_error_now || length_error_now;
+    // flags and fragment offset on bytes 6-7
+    // reserved mf and any offset are rejected while df is allowed
+    assign fragment_error_now = (stage == HEADER) && data_valid
+                              && (((header_index == 5'd6)
+                                && (data[7] || data[5] || (|data[4:0])))
+                               || ((header_index == 5'd7) && (|data)));
+
+    assign structural_error_now = version_ihl_error_now
+                                || length_error_now
+                                || fragment_error_now;
 
     // legal end on byte 19 with no payload or on the last payload byte
     assign payload_complete_now = ((stage == PAYLOAD) && data_valid
@@ -188,7 +197,7 @@ module ipv4_parser (
                             bytes_remaining <= length_candidate - 16'd20;
                         end
 
-                        if (length_error_now) begin
+                        if (length_error_now || fragment_error_now) begin
                             stage <= DROP;
                         end else if (header_index == 5'd19) begin
                             if (bytes_remaining == 0) begin
@@ -226,7 +235,7 @@ module ipv4_parser (
                 default: stage <= IDLE;
             endcase
 
-            // pass stream or truncation error to drop
+            // pass stream fragment or truncation error to drop
             if (packet_error_now) begin
                 stage <= DROP;
             end
