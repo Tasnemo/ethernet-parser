@@ -49,34 +49,88 @@ module udp_parser #(
 
     stage_t stage;
 
+    logic [2:0] header_index;
+
+    logic packet_context;
+    logic header_byte_active;
+
+    assign o_stream = data;
+
+    assign packet_context = (stage != IDLE) || (data_start && data_valid);
+    assign header_byte_active = data_valid
+                              && (((stage == IDLE) && data_start)
+                               || (stage == HEADER));
+
+    assign start_of_packet = data_start && data_valid;
+    assign end_of_packet = data_end && packet_context;
+
+    assign header_udp_valid = header_byte_active;
+    assign source_port_valid = 1'b0;
+    assign destination_port_valid = 1'b0;
+    assign length_valid = 1'b0;
+    assign checksum_valid = 1'b0;
+    assign payload_udp_valid = (stage == PAYLOAD) && data_valid;
+
+    assign end_of_payload = data_valid && data_last
+                          && ((stage == PAYLOAD)
+                           || ((stage == HEADER) && (header_index == 3'd7)));
+
+    assign udp_checksum_error = 1'b0;
+    assign udp_error = 1'b0;
+
     always_ff @(posedge clk) begin
         if (rst) begin
-            stage <= IDLE;
+            stage        <= IDLE;
+            header_index <= '0;
         end else begin
             case (stage)
-                IDLE,
-                HEADER,
-                PAYLOAD,
-                WAIT_END,
-                DROP: stage <= stage;
+                IDLE: begin
+                    header_index <= '0;
+
+                    if (data_start && data_valid) begin
+                        header_index <= 3'd1;
+                        stage        <= HEADER;
+                    end else begin
+                        stage <= IDLE;
+                    end
+                end
+
+                HEADER: begin
+                    if (data_valid) begin
+                        if (header_index == 3'd7) begin
+                            if (data_last) begin
+                                stage <= WAIT_END;
+                            end else begin
+                                stage <= PAYLOAD;
+                            end
+                        end else begin
+                            header_index <= header_index + 1'b1;
+                        end
+                    end
+                end
+
+                PAYLOAD: begin
+                    if (data_valid && data_last) begin
+                        stage <= WAIT_END;
+                    end
+                end
+
+                WAIT_END: begin
+                    stage <= WAIT_END;
+                end
+
+                DROP: begin
+                    stage <= DROP;
+                end
+
                 default: stage <= IDLE;
             endcase
-        end
-    end
 
-    always_comb begin
-        o_stream = 8'h00;
-        header_udp_valid = 1'b0;
-        source_port_valid = 1'b0;
-        destination_port_valid = 1'b0;
-        length_valid = 1'b0;
-        checksum_valid = 1'b0;
-        payload_udp_valid = 1'b0;
-        start_of_packet = 1'b0;
-        end_of_payload = 1'b0;
-        end_of_packet = 1'b0;
-        udp_checksum_error = 1'b0;
-        udp_error = 1'b0;
+            if (data_end && packet_context) begin
+                stage        <= IDLE;
+                header_index <= '0;
+            end
+        end
     end
 
 endmodule

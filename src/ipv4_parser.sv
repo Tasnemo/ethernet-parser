@@ -1,4 +1,4 @@
-module ipv4_parser (
+module ipv4_parser #(
     parameter int MAX_IPV4_BYTES = 1500
 ) (
     // clock and reset
