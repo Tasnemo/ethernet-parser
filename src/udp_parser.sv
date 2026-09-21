@@ -38,6 +38,11 @@ module udp_parser #(
     output logic       udp_error
 );
 
+    // general standards
+    localparam int UDP_HEADER_BYTES = 8;
+    localparam int LENGTH_WIDTH = (MAX_UDP_BYTES < UDP_HEADER_BYTES)
+                                ? 4 : $clog2(MAX_UDP_BYTES + 1);
+
     // protocol stages
     typedef enum logic [2:0] {
         IDLE,
@@ -52,9 +57,22 @@ module udp_parser #(
     // header position
     logic [2:0] header_index;
 
+    // udp length storage
+    logic [7:0] length_high;
+    logic [LENGTH_WIDTH-1:0] bytes_remaining;
+
     // header entities
     logic packet_context;
     logic header_byte_active;
+    logic [15:0] length_candidate;
+
+    // keep the configured size inside the udp length field
+    generate
+        if ((MAX_UDP_BYTES < UDP_HEADER_BYTES)
+            || (MAX_UDP_BYTES > 65535)) begin : invalid_max_udp_bytes
+            initial $fatal(1, "MAX_UDP_BYTES must be between 8 and 65535");
+        end
+    endgenerate
 
     // output stream
     assign o_stream = data;
@@ -64,6 +82,8 @@ module udp_parser #(
     assign header_byte_active = data_valid
                               && (((stage == IDLE) && data_start)
                                || (stage == HEADER));
+    // udp length joins on byte 5
+    assign length_candidate = {length_high, data};
 
     // packet framing signals
     assign start_of_packet = data_start && data_valid;
@@ -80,12 +100,14 @@ module udp_parser #(
                         && (header_index[2:1] == 2'd2);           // bytes 4-5
     assign checksum_valid = header_udp_valid
                           && (header_index[2:1] == 2'd3);         // bytes 6-7
-    assign payload_udp_valid = (stage == PAYLOAD) && data_valid;
+    assign payload_udp_valid = (stage == PAYLOAD) && data_valid
+                             && (bytes_remaining != 0);
 
-    // ipv4 marks the last segment byte
-    assign end_of_payload = data_valid && data_last
-                          && ((stage == PAYLOAD)
-                           || ((stage == HEADER) && (header_index == 3'd7)));
+    // udp length marks the last segment byte
+    assign end_of_payload = (payload_udp_valid && (bytes_remaining == 1))
+                          || ((stage == HEADER) && data_valid
+                           && (header_index == 3'd7)
+                           && (bytes_remaining == 0));
 
     assign udp_checksum_error = 1'b0;
     assign udp_error = 1'b0;
@@ -93,12 +115,16 @@ module udp_parser #(
 // parsing process
     always_ff @(posedge clk) begin
         if (rst) begin
-            stage        <= IDLE;
-            header_index <= '0;
+            stage           <= IDLE;
+            header_index    <= '0;
+            length_high     <= '0;
+            bytes_remaining <= '0;
         end else begin
             case (stage)
                 IDLE: begin
-                    header_index <= '0;
+                    header_index    <= '0;
+                    length_high     <= '0;
+                    bytes_remaining <= '0;
 
                     if (data_start && data_valid) begin
                         // byte 0 starts the header
@@ -111,9 +137,19 @@ module udp_parser #(
 
                 HEADER: begin
                     if (data_valid) begin
+                        if (header_index == 3'd4) begin
+                            // udp length high byte
+                            length_high <= data;
+                        end
+
+                        if (header_index == 3'd5) begin
+                            // udp length low byte
+                            bytes_remaining <= length_candidate - 16'd8;
+                        end
+
                         if (header_index == 3'd7) begin
                             // byte 7 ends the header
-                            if (data_last) begin
+                            if (bytes_remaining == 0) begin
                                 stage <= WAIT_END;
                             end else begin
                                 stage <= PAYLOAD;
@@ -125,8 +161,14 @@ module udp_parser #(
                 end
 
                 PAYLOAD: begin
-                    if (data_valid && data_last) begin
-                        stage <= WAIT_END;
+                    if (data_valid) begin
+                        // count only accepted stream bytes
+                        if (bytes_remaining > 1) begin
+                            bytes_remaining <= bytes_remaining - 1'b1;
+                        end else begin
+                            bytes_remaining <= '0;
+                            stage           <= WAIT_END;
+                        end
                     end
                 end
 
@@ -144,8 +186,10 @@ module udp_parser #(
 
             // frame boundary reset
             if (data_end && packet_context) begin
-                stage        <= IDLE;
-                header_index <= '0;
+                stage           <= IDLE;
+                header_index    <= '0;
+                length_high     <= '0;
+                bytes_remaining <= '0;
             end
         end
     end
