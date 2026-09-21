@@ -42,6 +42,7 @@ module udp_parser #(
     localparam int UDP_HEADER_BYTES = 8;
     localparam int LENGTH_WIDTH = (MAX_UDP_BYTES < UDP_HEADER_BYTES)
                                 ? 4 : $clog2(MAX_UDP_BYTES + 1);
+    localparam logic [15:0] MAX_UDP_VALUE = MAX_UDP_BYTES;
 
     // protocol stages
     typedef enum logic [2:0] {
@@ -64,7 +65,13 @@ module udp_parser #(
     // header entities
     logic packet_context;
     logic header_byte_active;
+    logic segment_byte_active;
     logic [15:0] length_candidate;
+    logic length_error_now;
+    logic payload_complete_now;
+    logic length_mismatch_now;
+    logic structural_error_now;
+    logic discard_now;
 
     // keep the configured size inside the udp length field
     generate
@@ -82,8 +89,33 @@ module udp_parser #(
     assign header_byte_active = data_valid
                               && (((stage == IDLE) && data_start)
                                || (stage == HEADER));
+    assign segment_byte_active = header_byte_active
+                               || ((stage == PAYLOAD) && data_valid);
     // udp length joins on byte 5
     assign length_candidate = {length_high, data};
+
+    // udp length check on byte 5
+    assign length_error_now = (stage == HEADER) && data_valid
+                            && (header_index == 3'd5)
+                            && ((length_candidate < 16'd8)
+                             || (length_candidate > MAX_UDP_VALUE));
+
+    // legal end on byte 7 with no payload or on the last payload byte
+    assign payload_complete_now = ((stage == PAYLOAD) && data_valid
+                                && (bytes_remaining == 1))
+                               || ((stage == HEADER) && data_valid
+                                && (header_index == 3'd7)
+                                && (bytes_remaining == 0));
+
+    // ipv4 payload end has to land on the udp length end
+    assign length_mismatch_now = segment_byte_active
+                               && (data_last != payload_complete_now);
+
+    assign structural_error_now = length_error_now || length_mismatch_now;
+
+    // drop stage holds the error through the packet
+    assign discard_now = (stage == DROP) || structural_error_now;
+    assign udp_error = discard_now;
 
     // packet framing signals
     assign start_of_packet = data_start && data_valid;
@@ -91,7 +123,7 @@ module udp_parser #(
 
     // field windows
     // index is 0 in idle so byte 0 decodes the same way
-    assign header_udp_valid = header_byte_active;                 // bytes 0-7
+    assign header_udp_valid = header_byte_active && !discard_now; // bytes 0-7
     assign source_port_valid = header_udp_valid
                              && (header_index[2:1] == 2'd0);      // bytes 0-1
     assign destination_port_valid = header_udp_valid
@@ -101,16 +133,12 @@ module udp_parser #(
     assign checksum_valid = header_udp_valid
                           && (header_index[2:1] == 2'd3);         // bytes 6-7
     assign payload_udp_valid = (stage == PAYLOAD) && data_valid
-                             && (bytes_remaining != 0);
+                             && (bytes_remaining != 0) && !discard_now;
 
     // udp length marks the last segment byte
-    assign end_of_payload = (payload_udp_valid && (bytes_remaining == 1))
-                          || ((stage == HEADER) && data_valid
-                           && (header_index == 3'd7)
-                           && (bytes_remaining == 0));
+    assign end_of_payload = payload_complete_now && !discard_now;
 
     assign udp_checksum_error = 1'b0;
-    assign udp_error = 1'b0;
 
 // parsing process
     always_ff @(posedge clk) begin
@@ -142,7 +170,7 @@ module udp_parser #(
                             length_high <= data;
                         end
 
-                        if (header_index == 3'd5) begin
+                        if ((header_index == 3'd5) && !length_error_now) begin
                             // udp length low byte
                             bytes_remaining <= length_candidate - 16'd8;
                         end
@@ -178,11 +206,17 @@ module udp_parser #(
                 end
 
                 DROP: begin
+                    // hold structural error until frame end
                     stage <= DROP;
                 end
 
                 default: stage <= IDLE;
             endcase
+
+            // bad length or mismatched end goes to drop
+            if (structural_error_now) begin
+                stage <= DROP;
+            end
 
             // frame boundary reset
             if (data_end && packet_context) begin
