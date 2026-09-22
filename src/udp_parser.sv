@@ -62,6 +62,9 @@ module udp_parser #(
     logic [7:0] length_high;
     logic [LENGTH_WIDTH-1:0] bytes_remaining;
 
+    // destination port high byte was zero
+    logic port_high_zero;
+
     // current byte checks
     logic packet_context;
     logic header_byte_active;
@@ -70,6 +73,7 @@ module udp_parser #(
     logic length_error_now;
     logic payload_complete_now;
     logic length_mismatch_now;
+    logic port_error_now;
     logic structural_error_now;
     logic upstream_error_now;
     logic truncation_error_now;
@@ -114,7 +118,13 @@ module udp_parser #(
     assign length_mismatch_now = segment_byte_active
                                && (data_last != payload_complete_now);
 
-    assign structural_error_now = length_error_now || length_mismatch_now;
+    // destination port 0 is reserved so nothing can listen on it
+    assign port_error_now = (stage == HEADER) && data_valid
+                          && (header_index == 3'd3)
+                          && port_high_zero && (data == 8'h00);
+
+    assign structural_error_now = length_error_now || length_mismatch_now
+                                || port_error_now;
 
     // pass stream errors through anywhere inside the packet
     assign upstream_error_now = packet_context && data_error;
@@ -161,12 +171,14 @@ module udp_parser #(
             header_index    <= '0;
             length_high     <= '0;
             bytes_remaining <= '0;
+            port_high_zero  <= 1'b0;
         end else begin
             case (stage)
                 IDLE: begin
                     header_index    <= '0;
                     length_high     <= '0;
                     bytes_remaining <= '0;
+                    port_high_zero  <= 1'b0;
 
                     if (data_start && data_valid) begin
                         // byte 0 starts the header
@@ -179,6 +191,11 @@ module udp_parser #(
 
                 HEADER: begin
                     if (data_valid) begin
+                        if (header_index == 3'd2) begin
+                            // destination port high byte
+                            port_high_zero <= (data == 8'h00);
+                        end
+
                         if (header_index == 3'd4) begin
                             // udp length high byte
                             length_high <= data;
@@ -238,6 +255,7 @@ module udp_parser #(
                 header_index    <= '0;
                 length_high     <= '0;
                 bytes_remaining <= '0;
+                port_high_zero  <= 1'b0;
             end
         end
     end
