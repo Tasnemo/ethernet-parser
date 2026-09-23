@@ -40,65 +40,63 @@ module udp_parser #(
 
     // general standards
     localparam int UDP_HEADER_BYTES = 8;
-    localparam int LENGTH_WIDTH = (MAX_UDP_BYTES < UDP_HEADER_BYTES)
-                                ? 4 : $clog2(MAX_UDP_BYTES + 1);
+    localparam int LENGTH_WIDTH = (MAX_UDP_BYTES < UDP_HEADER_BYTES) ? 4
+                                : (MAX_UDP_BYTES > 65535) ? 16
+                                : $clog2(MAX_UDP_BYTES + 1);
     localparam logic [15:0] MAX_UDP_VALUE = MAX_UDP_BYTES;
     localparam logic [15:0] UDP_PROTOCOL = 16'h0011;
 
     // protocol stages
-    typedef enum logic [2:0] {
-        IDLE,
-        HEADER,
-        PAYLOAD,
-        WAIT_END,
-        DROP
-    } stage_t;
+    // cursor doubles as header count and state
+    localparam logic [3:0] CURSOR_IDLE       = 4'd0;
+    localparam logic [3:0] CURSOR_PAYLOAD    = 4'd8;
+    localparam logic [3:0] CURSOR_WAIT_END   = 4'd9;
+    localparam logic [3:0] CURSOR_DROP       = 4'd10;
+    localparam logic [3:0] CURSOR_LENGTH_BAD = 4'd11;
+    localparam logic [LENGTH_WIDTH-1:0] TERMINAL_COUNT = 7;
 
-    stage_t stage;
-
-    // header position
-    logic [2:0] header_index;
+    // header position and protocol stage share the cursor
+    logic [3:0] cursor;
 
     // udp length storage
-    logic [7:0] length_high;
     logic [LENGTH_WIDTH-1:0] bytes_remaining;
-
-    // destination port high byte was zero
-    logic port_high_zero;
 
     // checksum storage
     logic [15:0] checksum_sum;
-    logic pseudo_low;
-    logic payload_low;
-    logic checksum_zero;
+    logic low_half;
+
+    // port high byte zero then checksum zero
+    logic field_zero;
 
     // current byte checks
     logic packet_context;
+    logic header_cursor_active;
     logic header_byte_active;
     logic segment_byte_active;
+    logic length_prefix_too_large;
     logic [15:0] length_candidate;
+    logic checksum_byte_high;
+    logic [15:0] checksum_word;
+    logic [15:0] checksum_next;
+
     logic length_error_now;
     logic payload_complete_now;
     logic length_mismatch_now;
     logic port_error_now;
-    logic structural_error_now;
-    logic upstream_error_now;
-    logic truncation_error_now;
-    logic packet_error_now;
-    logic output_abort;
-
-    // checksum entities
-    logic checksum_byte_high;
-    logic [15:0] checksum_byte_sum;
-    logic [15:0] checksum_next;
     logic checksum_skip_now;
     logic checksum_error_now;
+    logic truncation_error_now;
+    logic upstream_error_now;
+    logic local_error_now;
+    logic output_abort;
 
-    // keep the configured size inside the udp length field
+    // parameter check
     generate
         if ((MAX_UDP_BYTES < UDP_HEADER_BYTES)
             || (MAX_UDP_BYTES > 65535)) begin : invalid_max_udp_bytes
-            initial $fatal(1, "MAX_UDP_BYTES must be between 8 and 65535");
+            initial begin
+                $fatal(1);
+            end
         end
     endgenerate
 
@@ -114,235 +112,194 @@ module udp_parser #(
         end
     endfunction
 
-    // output stream
+    // stream position
     assign o_stream = data;
 
-    // header entities
-    assign packet_context = (stage != IDLE) || (data_start && data_valid);
+    assign packet_context = (cursor != CURSOR_IDLE)
+                          || (data_start && data_valid);
+    assign header_cursor_active = ((cursor > CURSOR_IDLE)
+                                && (cursor < CURSOR_PAYLOAD))
+                               || (cursor == CURSOR_LENGTH_BAD);
     assign header_byte_active = data_valid
-                              && (((stage == IDLE) && data_start)
-                               || (stage == HEADER));
+                              && (((cursor == CURSOR_IDLE) && data_start)
+                               || header_cursor_active);
     assign segment_byte_active = header_byte_active
-                               || ((stage == PAYLOAD) && data_valid);
-    // udp length joins on byte 5
-    assign length_candidate = {length_high, data};
+                               || ((cursor == CURSOR_PAYLOAD) && data_valid);
 
-    // udp length check on byte 5
-    assign length_error_now = (stage == HEADER) && data_valid
-                            && (header_index == 3'd5)
-                            && ((length_candidate < 16'd8)
-                             || (length_candidate > MAX_UDP_VALUE));
+    // stash length high bits in the remaining counter
+    // state 11 remembers overflow until byte 5
+    assign length_prefix_too_large = (cursor == 4'd4) && data_valid
+                                   && ({data, 8'b0} > MAX_UDP_VALUE);
+    assign length_candidate = {{(16 - LENGTH_WIDTH){1'b0}}, bytes_remaining}
+                            + data;
 
-    // legal end on byte 7 with no payload or on the last payload byte
-    assign payload_complete_now = ((stage == PAYLOAD) && data_valid
-                                && (bytes_remaining == 1))
-                               || ((stage == HEADER) && data_valid
-                                && (header_index == 3'd7)
-                                && (bytes_remaining == 0));
+    // header bytes take their half from the cursor
+    // pseudo and payload bytes share one toggle
+    assign checksum_byte_high = header_byte_active ? !cursor[0] : !low_half;
+    assign checksum_word = checksum_byte_high ? {data, 8'b0} : {8'b0, data};
 
-    // ipv4 payload end has to land on the udp length end
+    // length counts in the header and pseudo header
+    // doubling is a left rotate in ones complement
+    assign checksum_next = checksum_add_word(
+        checksum_sum,
+        (cursor[3:1] == 3'b010) ? {checksum_word[14:0], checksum_word[15]}
+                                : checksum_word
+    );
+
+    assign length_error_now = data_valid
+                            && ((cursor == CURSOR_LENGTH_BAD)
+                             || ((cursor == 4'd5)
+                              && ((length_candidate < 16'd8)
+                               || (length_candidate > MAX_UDP_VALUE))));
+
+    // counter is loaded with the full length so 7 marks the last byte
+    assign payload_complete_now = data_valid
+                                && ((cursor == CURSOR_PAYLOAD)
+                                 || (cursor == 4'd7))
+                                && (bytes_remaining == TERMINAL_COUNT);
+
     assign length_mismatch_now = segment_byte_active
                                && (data_last != payload_complete_now);
 
-    // destination port 0 is reserved so nothing can listen on it
-    assign port_error_now = (stage == HEADER) && data_valid
-                          && (header_index == 3'd3)
-                          && port_high_zero && (data == 8'h00);
+    assign port_error_now = (cursor == 4'd3) && data_valid
+                          && field_zero && (data == 8'h00);
 
-    // checksum covers the pseudo header, udp header, and payload
-    // sum starts at the protocol number and picks up the ip
-    // addresses in idle before the segment arrives
-    assign checksum_byte_high = header_byte_active ? !header_index[0]
-                              : (stage == IDLE)    ? !pseudo_low
-                              :                      !payload_low;
-    assign checksum_byte_sum = checksum_add_word(
-        checksum_sum,
-        checksum_byte_high ? {data, 8'b0} : {8'b0, data}
-    );
-    // udp length is in the header and the pseudo header
-    assign checksum_next = ((stage == HEADER) && (header_index == 3'd5))
-                         ? checksum_add_word(checksum_byte_sum,
-                                             length_candidate)
-                         : checksum_byte_sum;
-
-    // zero checksum field means the sender skipped it
-    assign checksum_skip_now = ((stage == HEADER) && (header_index == 3'd7))
-                             ? (checksum_zero && (data == 8'h00))
-                             : checksum_zero;
-    // odd payload pads low with zero so the sum is already done
+    assign checksum_skip_now = field_zero
+                             && ((cursor != 4'd7) || (data == 8'h00));
     assign checksum_error_now = payload_complete_now && !checksum_skip_now
                               && (checksum_next != 16'hFFFF);
 
-    assign structural_error_now = length_error_now || length_mismatch_now
-                                || port_error_now;
-
-    // pass stream errors through anywhere inside the packet
-    assign upstream_error_now = packet_context && data_error;
-    // early data_end means truncated packet
     assign truncation_error_now = data_end && packet_context
-                                && (stage != WAIT_END) && (stage != DROP)
+                                && (cursor != CURSOR_WAIT_END)
+                                && (cursor != CURSOR_DROP)
                                 && !payload_complete_now;
+    assign upstream_error_now = packet_context && data_error;
+    assign local_error_now = length_error_now || length_mismatch_now
+                           || port_error_now || checksum_error_now
+                           || truncation_error_now;
 
-    assign packet_error_now = structural_error_now
-                            || checksum_error_now
-                            || upstream_error_now
-                            || truncation_error_now;
+    assign output_abort = (cursor == CURSOR_DROP) || upstream_error_now;
 
-    // earlier bytes stay speculative and later bytes stop on error
-    assign output_abort = (stage == DROP) || upstream_error_now;
-    assign udp_error = (stage == DROP) || packet_error_now;
-
-    // packet framing signals
+    // packet signals
     assign start_of_packet = data_start && data_valid;
     assign end_of_packet = data_end && packet_context;
+    assign udp_checksum_error = checksum_error_now;
+    assign udp_error = (cursor == CURSOR_DROP)
+                     || upstream_error_now || local_error_now;
 
-    // field windows
-    // index is 0 in idle so byte 0 decodes the same way
-    assign header_udp_valid = header_byte_active && !output_abort; // bytes 0-7
+    // field windows line up with the current byte
+    assign header_udp_valid = header_byte_active && !output_abort;
     assign source_port_valid = header_udp_valid
-                             && (header_index[2:1] == 2'd0);      // bytes 0-1
+                             && (cursor[3:1] == 3'b000);
     assign destination_port_valid = header_udp_valid
-                                  && (header_index[2:1] == 2'd1); // bytes 2-3
+                                  && (cursor[3:1] == 3'b001);
     assign length_valid = header_udp_valid
-                        && (header_index[2:1] == 2'd2);           // bytes 4-5
+                        && ((cursor[3:1] == 3'b010)
+                         || (cursor == CURSOR_LENGTH_BAD));
     assign checksum_valid = header_udp_valid
-                          && (header_index[2:1] == 2'd3);         // bytes 6-7
-    assign payload_udp_valid = (stage == PAYLOAD) && data_valid
-                             && (bytes_remaining != 0) && !output_abort;
+                          && (cursor[3:1] == 3'b011);
+    assign payload_udp_valid = (cursor == CURSOR_PAYLOAD) && data_valid
+                             && !output_abort;
 
-    // udp length marks the last segment byte
     assign end_of_payload = payload_complete_now && !output_abort;
 
-    assign udp_checksum_error = checksum_error_now;
-
-// parsing process
+    // parsing process
     always_ff @(posedge clk) begin
         if (rst) begin
-            stage           <= IDLE;
-            header_index    <= '0;
-            length_high     <= '0;
+            cursor          <= CURSOR_IDLE;
             bytes_remaining <= '0;
-            port_high_zero  <= 1'b0;
             checksum_sum    <= UDP_PROTOCOL;
-            pseudo_low      <= 1'b0;
-            payload_low     <= 1'b0;
-            checksum_zero   <= 1'b0;
+            low_half        <= 1'b0;
+            field_zero      <= 1'b0;
         end else begin
-            case (stage)
-                IDLE: begin
-                    header_index    <= '0;
-                    length_high     <= '0;
-                    bytes_remaining <= '0;
-                    port_high_zero  <= 1'b0;
-                    payload_low     <= 1'b0;
-                    checksum_zero   <= 1'b0;
+            if (cursor == CURSOR_IDLE) begin
+                cursor          <= CURSOR_IDLE;
+                bytes_remaining <= '0;
+                field_zero      <= 1'b0;
 
-                    if (pseudo_valid) begin
-                        // source and destination ip in network order
-                        checksum_sum <= checksum_next;
-                        pseudo_low   <= !pseudo_low;
-                    end
-
-                    if (data_start && data_valid) begin
-                        // byte 0 starts the header
-                        checksum_sum <= checksum_next;
-                        header_index <= 3'd1;
-                        stage        <= HEADER;
-                    end else begin
-                        stage <= IDLE;
-                    end
+                if (pseudo_valid) begin
+                    checksum_sum <= checksum_next;
+                    low_half     <= !low_half;
                 end
 
-                HEADER: begin
-                    if (data_valid) begin
-                        checksum_sum <= checksum_next;
+                if (data_start && data_valid) begin
+                    checksum_sum <= checksum_next;
+                    if (length_mismatch_now) begin
+                        cursor <= CURSOR_DROP;
+                    end else begin
+                        cursor <= 4'd1;
+                    end
+                end
+            end else if (header_cursor_active) begin
+                if (data_valid) begin
+                    checksum_sum <= checksum_next;
 
-                        if (header_index == 3'd2) begin
-                            // destination port high byte
-                            port_high_zero <= (data == 8'h00);
+                    if ((cursor == 4'd2) || (cursor == 4'd6)) begin
+                        field_zero <= (data == 8'h00);
+                    end else if (cursor == 4'd7) begin
+                        field_zero <= field_zero && (data == 8'h00);
+                    end
+
+                    if (cursor == 4'd4) begin
+                        if (length_prefix_too_large) begin
+                            cursor <= CURSOR_LENGTH_BAD;
+                        end else begin
+                            bytes_remaining <= {data, 8'b0};
+                            cursor <= 4'd5;
+                        end
+                    end else if (cursor == CURSOR_LENGTH_BAD) begin
+                        cursor <= CURSOR_DROP;
+                    end else if (cursor == 4'd5) begin
+                        if (length_error_now) begin
+                            cursor <= CURSOR_DROP;
+                        end else begin
+                            bytes_remaining <= length_candidate;
+                            cursor <= 4'd6;
+                        end
+                    end else begin
+                        if (cursor >= 4'd6) begin
+                            bytes_remaining <= bytes_remaining - 1'b1;
                         end
 
-                        if (header_index == 3'd4) begin
-                            // udp length high byte
-                            length_high <= data;
-                        end
-
-                        if ((header_index == 3'd5) && !length_error_now) begin
-                            // udp length low byte
-                            bytes_remaining <= length_candidate - 16'd8;
-                        end
-
-                        if (header_index == 3'd6) begin
-                            // checksum high byte
-                            checksum_zero <= (data == 8'h00);
-                        end
-
-                        if (header_index == 3'd7) begin
-                            // checksum low byte
-                            checksum_zero <= checksum_zero && (data == 8'h00);
-                        end
-
-                        if (header_index == 3'd7) begin
-                            // byte 7 ends the header
-                            if (bytes_remaining == 0) begin
-                                stage <= WAIT_END;
+                        if (cursor == 4'd7) begin
+                            if (bytes_remaining == TERMINAL_COUNT) begin
+                                cursor <= CURSOR_WAIT_END;
                             end else begin
-                                stage <= PAYLOAD;
+                                cursor <= CURSOR_PAYLOAD;
                             end
                         end else begin
-                            header_index <= header_index + 1'b1;
+                            cursor <= cursor + 1'b1;
                         end
                     end
                 end
-
-                PAYLOAD: begin
-                    if (data_valid) begin
-                        checksum_sum <= checksum_next;
-                        payload_low  <= !payload_low;
-
-                        // count only accepted stream bytes
-                        if (bytes_remaining > 1) begin
-                            bytes_remaining <= bytes_remaining - 1'b1;
-                        end else begin
-                            bytes_remaining <= '0;
-                            stage           <= WAIT_END;
-                        end
+            end else if (cursor == CURSOR_PAYLOAD) begin
+                if (data_valid) begin
+                    checksum_sum    <= checksum_next;
+                    low_half        <= !low_half;
+                    bytes_remaining <= bytes_remaining - 1'b1;
+                    if (bytes_remaining == TERMINAL_COUNT) begin
+                        cursor <= CURSOR_WAIT_END;
                     end
                 end
-
-                WAIT_END: begin
-                    // wait for the frame boundary
-                    stage <= WAIT_END;
-                end
-
-                DROP: begin
-                    // hold error through the packet boundary
-                    stage <= DROP;
-                end
-
-                default: stage <= IDLE;
-            endcase
-
-            // structural, checksum, stream, or truncation error to drop
-            if (packet_error_now) begin
-                stage <= DROP;
+            end else if (cursor == CURSOR_WAIT_END) begin
+                cursor <= CURSOR_WAIT_END;
+            end else begin
+                cursor <= CURSOR_DROP;
             end
 
-            // every frame boundary restarts the pseudo header sum
+            if (local_error_now || upstream_error_now) begin
+                cursor <= CURSOR_DROP;
+            end
+
             if (data_end) begin
                 checksum_sum <= UDP_PROTOCOL;
-                pseudo_low   <= 1'b0;
+                low_half     <= 1'b0;
             end
 
-            // packet boundary has final priority
             if (data_end && packet_context) begin
-                stage           <= IDLE;
-                header_index    <= '0;
-                length_high     <= '0;
+                cursor          <= CURSOR_IDLE;
                 bytes_remaining <= '0;
-                port_high_zero  <= 1'b0;
-                payload_low     <= 1'b0;
-                checksum_zero   <= 1'b0;
+                field_zero      <= 1'b0;
             end
         end
     end
