@@ -1,241 +1,292 @@
 module ipv4_parser #(
     parameter int MAX_IPV4_BYTES = 1500
+    // purely internet layer
 ) (
     // clock and reset
-    input  logic       clk,
-    input  logic       rst,
+    input logic clk,
+    input logic rst,
 
     // input stream
-    input  logic [7:0] data,
-    input  logic       data_valid,
-    input  logic       data_start,
-    input  logic       data_end,
-    input  logic       data_error,
+    input logic [7:0] data,
+    input logic data_valid,
+    input logic data_start,
+    input logic data_end,
+    input logic data_error,
 
     // output stream
     output logic [7:0] o_stream,
 
     //stage valid signals
-    output logic       header_ipv4_valid,
-    output logic       total_length_valid,
-    output logic       protocol_valid,
-    output logic       source_ip_valid,
-    output logic       destination_ip_valid,
-    output logic       payload_ipv4_valid,
+    output logic header_ipv4_valid,
+    output logic total_length_valid,
+    output logic protocol_valid,
+    output logic source_ip_valid,
+    output logic destination_ip_valid,
+    output logic payload_ipv4_valid,
 
     // progress checking
-    output logic       start_of_packet,
-    output logic       end_of_payload,
-    output logic       end_of_packet,
+    output logic start_of_packet,
+    output logic end_of_payload,
+    output logic end_of_packet,
 
     // error output
-    output logic       header_checksum_error,
-    output logic       ipv4_error
+    output logic header_checksum_error,
+    output logic ipv4_error
 );
 
     // general standards
     localparam int IPV4_HEADER_BYTES = 20;
-    localparam int LENGTH_WIDTH = (MAX_IPV4_BYTES < IPV4_HEADER_BYTES)
-                                ? 5 : $clog2(MAX_IPV4_BYTES + 1);
+    localparam int LENGTH_WIDTH = (MAX_IPV4_BYTES < IPV4_HEADER_BYTES) ? 5
+                                : (MAX_IPV4_BYTES > 65535) ? 16
+                                : $clog2(MAX_IPV4_BYTES + 1);
     localparam logic [15:0] MAX_IPV4_VALUE = MAX_IPV4_BYTES;
 
     // protocol stages
-    typedef enum logic [2:0] {
-        IDLE,
-        HEADER,
-        PAYLOAD,
-        WAIT_END,
-        DROP
-    } stage_t;
+    // cursor doubles as header count and state
+    // 5 cursor + 11 remaining + 16 checksum = 32 bits
+    localparam logic [4:0] CURSOR_IDLE        = 5'd0;
+    localparam logic [4:0] CURSOR_PAYLOAD     = 5'd20;
+    localparam logic [4:0] CURSOR_WAIT_END    = 5'd21;
+    localparam logic [4:0] CURSOR_DROP        = 5'd22;
+    localparam logic [4:0] CURSOR_LENGTH_BAD  = 5'd23;
+    localparam logic [LENGTH_WIDTH-1:0] TERMINAL_COUNT = 5;
 
-    stage_t stage;
-
-    // header position
-    logic [4:0] header_index;
+    // header position and protocol stage share the cursor
+    logic [4:0] cursor;
 
     // total length storage
-    logic [7:0] length_high;
     logic [LENGTH_WIDTH-1:0] bytes_remaining;
+
+    // checksum storage
+    logic [15:0] checksum_sum;
 
     // current byte checks
     logic packet_context;
     logic header_byte_active;
+    logic header_cursor_active;
     logic [15:0] length_candidate;
-    logic version_ihl_error_now;
-    logic length_error_now;
-    logic structural_error_now;
-    logic upstream_error_now;
-    logic payload_complete_now;
-    logic truncation_error_now;
-    logic packet_error_now;
-    logic output_abort;
+    logic [15:0] checksum_next;
 
-    // keep the configured size inside the ipv4 length field
+    logic version_ihl_error_now;
+    logic length_prefix_too_large;
+    logic length_error_now;
+    logic fragment_error_now;
+    logic checksum_error_now;
+    logic truncation_error_now;
+    logic upstream_error_now;
+    logic local_error_now;
+    logic output_abort;
+    logic payload_complete_now;
+
+    // parameter check
     generate
         if ((MAX_IPV4_BYTES < IPV4_HEADER_BYTES)
             || (MAX_IPV4_BYTES > 65535)) begin : invalid_max_ipv4_bytes
-            initial $fatal(1, "MAX_IPV4_BYTES must be between 20 and 65535");
+            initial begin
+                $fatal(1);
+            end
         end
     endgenerate
+
+    // one byte through the checksum in network order
+    function automatic logic [15:0] checksum_add_byte(
+        input logic [15:0] sum,
+        input logic [7:0] byte_value,
+        input logic high_byte
+    );
+        logic [16:0] addition;
+        begin
+            if (high_byte) begin
+                addition = {1'b0, sum} + {1'b0, byte_value, 8'b0};
+            end else begin
+                addition = {1'b0, sum} + {9'b0, byte_value};
+            end
+            checksum_add_byte = addition[15:0] + addition[16];
+        end
+    endfunction
 
     // output stream
     assign o_stream = data;
 
     // header entities
-    assign packet_context = (stage != IDLE) || (data_start && data_valid);
+    assign packet_context = (cursor != CURSOR_IDLE)
+                          || (data_start && data_valid);
+    assign header_cursor_active = ((cursor > CURSOR_IDLE)
+                                && (cursor < CURSOR_PAYLOAD))
+                               || (cursor == CURSOR_LENGTH_BAD);
     assign header_byte_active = data_valid
-                              && (((stage == IDLE) && data_start)
-                               || (stage == HEADER));
-    assign length_candidate = {length_high, data};
+                              && (((cursor == CURSOR_IDLE) && data_start)
+                               || header_cursor_active);
+
+    // total length joins on byte 3
+    // stash length high bits in the remaining counter
+    // state 23 remembers overflow until byte 3
+    assign length_prefix_too_large = (cursor == 5'd2) && data_valid
+                                   && ({data, 8'b0} > MAX_IPV4_VALUE);
+    assign length_candidate = {{(16 - LENGTH_WIDTH){1'b0}}, bytes_remaining}
+                            + data;
+
+    // even bytes fill the high half of each checksum word
+    assign checksum_next = checksum_add_byte(
+        checksum_sum,
+        data,
+        (cursor == CURSOR_IDLE) ? 1'b1 : !cursor[0]
+    );
 
     // version and ihl on byte 0
-    assign version_ihl_error_now = (stage == IDLE) && data_start && data_valid
+    assign version_ihl_error_now = (cursor == CURSOR_IDLE)
+                                 && data_start && data_valid
                                  && ((data[7:4] != 4'h4)
                                   || (data[3:0] != 4'h5));
 
-    // total length ends on byte 3
-    assign length_error_now = (stage == HEADER) && data_valid
-                            && (header_index == 5'd3)
-                            && ((length_candidate < 16'd20)
-                             || (length_candidate > MAX_IPV4_VALUE));
+    // total length check on byte 3
+    assign length_error_now = data_valid
+                            && ((cursor == CURSOR_LENGTH_BAD)
+                             || ((cursor == 5'd3)
+                              && ((length_candidate < 16'd20)
+                               || (length_candidate > MAX_IPV4_VALUE))));
 
-    assign structural_error_now = version_ihl_error_now || length_error_now;
+    // flags and fragment offset on bytes 6-7
+    // no reassembly so allow df and reject mf, reserved, or offset
+    assign fragment_error_now = data_valid
+                              && (((cursor == 5'd6)
+                                && (data[7] || data[5] || (|data[4:0])))
+                               || ((cursor == 5'd7) && (|data)));
+
+    // all header words must sum to ones by byte 19
+    assign checksum_error_now = (cursor == 5'd19) && data_valid
+                              && (checksum_next != 16'hFFFF);
 
     // legal end on byte 19 with no payload or on the last payload byte
-    assign payload_complete_now = ((stage == PAYLOAD) && data_valid
-                                && (bytes_remaining == 1))
-                               || ((stage == HEADER) && data_valid
-                                && (header_index == 5'd19)
-                                && (bytes_remaining == 0));
+    // counter is biased by 4 so 5 marks the last ipv4 byte
+    assign payload_complete_now = ((cursor == CURSOR_PAYLOAD) && data_valid
+                                && (bytes_remaining == TERMINAL_COUNT))
+                               || ((cursor == 5'd19) && data_valid
+                                && (bytes_remaining == TERMINAL_COUNT));
 
-    // pass stream errors through anywhere inside the packet
-    assign upstream_error_now = packet_context && data_error;
     // early data_end means truncated packet
     assign truncation_error_now = data_end && packet_context
-                                && (stage != WAIT_END) && (stage != DROP)
+                                && (cursor != CURSOR_WAIT_END)
+                                && (cursor != CURSOR_DROP)
                                 && !payload_complete_now;
+    // pass stream errors through anywhere inside the packet
+    assign upstream_error_now = packet_context && data_error;
+    assign local_error_now = version_ihl_error_now || length_error_now
+                           || fragment_error_now || checksum_error_now
+                           || truncation_error_now;
 
-    assign packet_error_now = structural_error_now
-                            || upstream_error_now
-                            || truncation_error_now;
-
-    // earlier bytes stay speculative and later bytes stop on error
-    assign output_abort = (stage == DROP) || upstream_error_now;
-    assign ipv4_error = (stage == DROP) || packet_error_now;
+    // local errors stop later bytes
+    // data_error also kills the current byte
+    assign output_abort = (cursor == CURSOR_DROP) || upstream_error_now;
 
     // packet framing signals
     assign start_of_packet = data_start && data_valid;
     assign end_of_packet = data_end && packet_context;
+    assign header_checksum_error = checksum_error_now;
+    assign ipv4_error = (cursor == CURSOR_DROP)
+                      || upstream_error_now || local_error_now;
 
-    // field windows
-    assign header_ipv4_valid = header_byte_active && !output_abort;
-    assign total_length_valid = header_ipv4_valid && (stage == HEADER)
-                              && ((header_index == 5'd2)
-                               || (header_index == 5'd3)); // bytes 2-3
-    assign protocol_valid = header_ipv4_valid && (stage == HEADER)
-                          && (header_index == 5'd9);       // byte 9
-    assign source_ip_valid = header_ipv4_valid && (stage == HEADER)
-                           && (header_index >= 5'd12)
-                           && (header_index <= 5'd15);     // bytes 12-15
-    assign destination_ip_valid = header_ipv4_valid && (stage == HEADER)
-                                && (header_index >= 5'd16)
-                                && (header_index <= 5'd19); // bytes 16-19
-    assign payload_ipv4_valid = (stage == PAYLOAD) && data_valid
-                              && (bytes_remaining != 0) && !output_abort;
+    // field windows line up with the current byte
+    assign header_ipv4_valid = header_byte_active && !output_abort; // bytes 0-19
+    assign total_length_valid = header_ipv4_valid
+                              && ((cursor == 5'd2) || (cursor == 5'd3)
+                               || (cursor == CURSOR_LENGTH_BAD)); // bytes 2-3
+    assign protocol_valid = header_ipv4_valid && (cursor == 5'd9); // byte 9
+    assign source_ip_valid = header_ipv4_valid
+                           && (cursor[4:2] == 3'b011); // bytes 12-15
+    assign destination_ip_valid = header_ipv4_valid
+                                && (cursor[4:2] == 3'b100); // bytes 16-19
+    assign payload_ipv4_valid = (cursor == CURSOR_PAYLOAD) && data_valid
+                              && !output_abort;
 
     assign end_of_payload = !output_abort
-                          && ((payload_ipv4_valid && (bytes_remaining == 1))
-                           || ((stage == HEADER) && data_valid
-                            && (header_index == 5'd19)
-                            && (bytes_remaining == 0)));
-
-    assign header_checksum_error = 1'b0;
+                          && ((payload_ipv4_valid
+                            && (bytes_remaining == TERMINAL_COUNT))
+                           || ((cursor == 5'd19) && data_valid
+                            && (bytes_remaining == TERMINAL_COUNT)));
 
     // parsing process
     always_ff @(posedge clk) begin
         if (rst) begin
-            stage           <= IDLE;
-            header_index    <= '0;
-            length_high     <= '0;
+            cursor          <= CURSOR_IDLE;
             bytes_remaining <= '0;
+            checksum_sum    <= '0;
         end else begin
-            case (stage)
-                IDLE: begin
-                    header_index    <= '0;
-                    length_high     <= '0;
-                    bytes_remaining <= '0;
+            if (cursor == CURSOR_IDLE) begin
+                cursor          <= CURSOR_IDLE;
+                bytes_remaining <= '0;
+                checksum_sum    <= '0;
 
-                    if (data_start && data_valid) begin
-                        header_index <= 5'd1;
-                        if (version_ihl_error_now) begin
-                            stage <= DROP;
+                if (data_start && data_valid) begin
+                    checksum_sum <= {data, 8'b0};
+                    if (version_ihl_error_now) begin
+                        cursor <= CURSOR_DROP;
+                    end else begin
+                        cursor <= 5'd1;
+                    end
+                end
+            end else if (header_cursor_active) begin
+                if (data_valid) begin
+                    checksum_sum <= checksum_next;
+
+                    if (cursor == 5'd2) begin
+                        if (length_prefix_too_large) begin
+                            cursor <= CURSOR_LENGTH_BAD;
                         end else begin
-                            stage <= HEADER;
+                            bytes_remaining <= {data, 8'b0};
+                            cursor <= 5'd3;
+                        end
+                    end else if (cursor == CURSOR_LENGTH_BAD) begin
+                        cursor <= CURSOR_DROP;
+                    end else if (cursor == 5'd3) begin
+                        if (length_error_now) begin
+                            cursor <= CURSOR_DROP;
+                        end else begin
+                            bytes_remaining <= length_candidate;
+                            cursor <= 5'd4;
                         end
                     end else begin
-                        stage <= IDLE;
-                    end
-                end
-
-                HEADER: begin
-                    if (data_valid) begin
-                        if (header_index == 5'd2) begin
-                            length_high <= data;
+                        if (cursor >= 5'd4) begin
+                            bytes_remaining <= bytes_remaining - 1'b1;
                         end
 
-                        if ((header_index == 5'd3) && !length_error_now) begin
-                            bytes_remaining <= length_candidate - 16'd20;
-                        end
-
-                        if (length_error_now) begin
-                            stage <= DROP;
-                        end else if (header_index == 5'd19) begin
-                            if (bytes_remaining == 0) begin
-                                stage <= WAIT_END;
+                        if (fragment_error_now || checksum_error_now) begin
+                            cursor <= CURSOR_DROP;
+                        end else if (cursor == 5'd19) begin
+                            if (bytes_remaining == TERMINAL_COUNT) begin
+                                cursor <= CURSOR_WAIT_END;
                             end else begin
-                                stage <= PAYLOAD;
+                                cursor <= CURSOR_PAYLOAD;
                             end
                         end else begin
-                            header_index <= header_index + 1'b1;
+                            cursor <= cursor + 1'b1;
                         end
                     end
                 end
-
-                PAYLOAD: begin
-                    if (data_valid) begin
-                        if (bytes_remaining > 1) begin
-                            bytes_remaining <= bytes_remaining - 1'b1;
-                        end else begin
-                            bytes_remaining <= '0;
-                            stage           <= WAIT_END;
-                        end
+            end else if (cursor == CURSOR_PAYLOAD) begin
+                if (data_valid) begin
+                    bytes_remaining <= bytes_remaining - 1'b1;
+                    if (bytes_remaining == TERMINAL_COUNT) begin
+                        cursor <= CURSOR_WAIT_END;
                     end
                 end
-
-                WAIT_END: begin
-                    // ignore ethernet padding after ipv4 payload
-                    stage <= WAIT_END;
-                end
-
-                DROP: begin
-                    // hold error through the packet boundary
-                    stage <= DROP;
-                end
-
-                default: stage <= IDLE;
-            endcase
-
-            // pass stream or truncation error to drop
-            if (packet_error_now) begin
-                stage <= DROP;
+            end else if (cursor == CURSOR_WAIT_END) begin
+                // drain ethernet padding
+                cursor <= CURSOR_WAIT_END;
+            end else begin
+                // drop and unused states fail closed
+                cursor <= CURSOR_DROP;
             end
 
-            // packet boundary has final priority
+            if (upstream_error_now) begin
+                cursor <= CURSOR_DROP;
+            end
+
+            // data_end wins so drop cannot stick
             if (data_end && packet_context) begin
-                stage           <= IDLE;
-                header_index    <= '0;
-                length_high     <= '0;
+                cursor          <= CURSOR_IDLE;
                 bytes_remaining <= '0;
+                checksum_sum    <= '0;
             end
         end
     end
