@@ -105,10 +105,9 @@ module ipv4_parser #(
         end
     endfunction
 
-    // output stream
+    // stream position
     assign o_stream = data;
 
-    // header entities
     assign packet_context = (cursor != CURSOR_IDLE)
                           || (data_start && data_valid);
     assign header_cursor_active = ((cursor > CURSOR_IDLE)
@@ -118,7 +117,6 @@ module ipv4_parser #(
                               && (((cursor == CURSOR_IDLE) && data_start)
                                || header_cursor_active);
 
-    // total length joins on byte 3
     // stash length high bits in the remaining counter
     // state 23 remembers overflow until byte 3
     assign length_prefix_too_large = (cursor == 5'd2) && data_valid
@@ -126,50 +124,43 @@ module ipv4_parser #(
     assign length_candidate = {{(16 - LENGTH_WIDTH){1'b0}}, bytes_remaining}
                             + data;
 
-    // even bytes fill the high half of each checksum word
+    // next checksum value
     assign checksum_next = checksum_add_byte(
         checksum_sum,
         data,
         (cursor == CURSOR_IDLE) ? 1'b1 : !cursor[0]
     );
 
-    // version and ihl on byte 0
     assign version_ihl_error_now = (cursor == CURSOR_IDLE)
                                  && data_start && data_valid
                                  && ((data[7:4] != 4'h4)
                                   || (data[3:0] != 4'h5));
 
-    // total length check on byte 3
     assign length_error_now = data_valid
                             && ((cursor == CURSOR_LENGTH_BAD)
                              || ((cursor == 5'd3)
                               && ((length_candidate < 16'd20)
                                || (length_candidate > MAX_IPV4_VALUE))));
 
-    // flags and fragment offset on bytes 6-7
     // no reassembly so allow df and reject mf, reserved, or offset
     assign fragment_error_now = data_valid
                               && (((cursor == 5'd6)
                                 && (data[7] || data[5] || (|data[4:0])))
                                || ((cursor == 5'd7) && (|data)));
 
-    // all header words must sum to ones by byte 19
     assign checksum_error_now = (cursor == 5'd19) && data_valid
                               && (checksum_next != 16'hFFFF);
 
-    // legal end on byte 19 with no payload or on the last payload byte
     // counter is biased by 4 so 5 marks the last ipv4 byte
     assign payload_complete_now = ((cursor == CURSOR_PAYLOAD) && data_valid
                                 && (bytes_remaining == TERMINAL_COUNT))
                                || ((cursor == 5'd19) && data_valid
                                 && (bytes_remaining == TERMINAL_COUNT));
 
-    // early data_end means truncated packet
     assign truncation_error_now = data_end && packet_context
                                 && (cursor != CURSOR_WAIT_END)
                                 && (cursor != CURSOR_DROP)
                                 && !payload_complete_now;
-    // pass stream errors through anywhere inside the packet
     assign upstream_error_now = packet_context && data_error;
     assign local_error_now = version_ihl_error_now || length_error_now
                            || fragment_error_now || checksum_error_now
@@ -179,7 +170,7 @@ module ipv4_parser #(
     // data_error also kills the current byte
     assign output_abort = (cursor == CURSOR_DROP) || upstream_error_now;
 
-    // packet framing signals
+    // packet signals
     assign start_of_packet = data_start && data_valid;
     assign end_of_packet = data_end && packet_context;
     assign header_checksum_error = checksum_error_now;
@@ -187,15 +178,15 @@ module ipv4_parser #(
                       || upstream_error_now || local_error_now;
 
     // field windows line up with the current byte
-    assign header_ipv4_valid = header_byte_active && !output_abort; // bytes 0-19
+    assign header_ipv4_valid = header_byte_active && !output_abort;
     assign total_length_valid = header_ipv4_valid
                               && ((cursor == 5'd2) || (cursor == 5'd3)
-                               || (cursor == CURSOR_LENGTH_BAD)); // bytes 2-3
-    assign protocol_valid = header_ipv4_valid && (cursor == 5'd9); // byte 9
+                               || (cursor == CURSOR_LENGTH_BAD));
+    assign protocol_valid = header_ipv4_valid && (cursor == 5'd9);
     assign source_ip_valid = header_ipv4_valid
-                           && (cursor[4:2] == 3'b011); // bytes 12-15
+                           && (cursor[4:2] == 3'b011);
     assign destination_ip_valid = header_ipv4_valid
-                                && (cursor[4:2] == 3'b100); // bytes 16-19
+                                && (cursor[4:2] == 3'b100);
     assign payload_ipv4_valid = (cursor == CURSOR_PAYLOAD) && data_valid
                               && !output_abort;
 
