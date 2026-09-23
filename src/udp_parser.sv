@@ -3,39 +3,39 @@ module udp_parser #(
     // purely transport layer
 ) (
     // clock and reset
-    input  logic       clk,
-    input  logic       rst,
+    input logic clk,
+    input logic rst,
 
     // input stream
-    input  logic [7:0] data,
-    input  logic       data_valid,
-    input  logic       data_start,
-    input  logic       data_last,
-    input  logic       data_end,
-    input  logic       data_error,
+    input logic [7:0] data,
+    input logic data_valid,
+    input logic data_start,
+    input logic data_last,
+    input logic data_end,
+    input logic data_error,
 
     // pseudo header bytes
-    input  logic       pseudo_valid,
+    input logic pseudo_valid,
 
     // output stream
     output logic [7:0] o_stream,
 
     //stage valid signals
-    output logic       header_udp_valid,
-    output logic       source_port_valid,
-    output logic       destination_port_valid,
-    output logic       length_valid,
-    output logic       checksum_valid,
-    output logic       payload_udp_valid,
+    output logic header_udp_valid,
+    output logic source_port_valid,
+    output logic destination_port_valid,
+    output logic length_valid,
+    output logic checksum_valid,
+    output logic payload_udp_valid,
 
     // progress checking
-    output logic       start_of_packet,
-    output logic       end_of_payload,
-    output logic       end_of_packet,
+    output logic start_of_packet,
+    output logic end_of_payload,
+    output logic end_of_packet,
 
     // error output
-    output logic       udp_checksum_error,
-    output logic       udp_error
+    output logic udp_checksum_error,
+    output logic udp_error
 );
 
     // general standards
@@ -48,6 +48,7 @@ module udp_parser #(
 
     // protocol stages
     // cursor doubles as header count and state
+    // 4 cursor + 11 remaining + 16 checksum + 2 flags = 33 bits
     localparam logic [3:0] CURSOR_IDLE       = 4'd0;
     localparam logic [3:0] CURSOR_PAYLOAD    = 4'd8;
     localparam logic [3:0] CURSOR_WAIT_END   = 4'd9;
@@ -87,7 +88,7 @@ module udp_parser #(
     logic checksum_error_now;
     logic truncation_error_now;
     logic upstream_error_now;
-    logic local_error_now;
+    logic packet_error_now;
     logic output_abort;
 
     // parameter check
@@ -133,6 +134,8 @@ module udp_parser #(
     assign length_candidate = {{(16 - LENGTH_WIDTH){1'b0}}, bytes_remaining}
                             + data;
 
+    // sum starts at the protocol number and picks up the ip
+    // addresses in idle before the segment arrives
     // header bytes take their half from the cursor
     // pseudo and payload bytes share one toggle
     assign checksum_byte_high = header_byte_active ? !cursor[0] : !low_half;
@@ -158,12 +161,16 @@ module udp_parser #(
                                  || (cursor == 4'd7))
                                 && (bytes_remaining == TERMINAL_COUNT);
 
+    // ipv4 payload end has to land on the udp length end
     assign length_mismatch_now = segment_byte_active
                                && (data_last != payload_complete_now);
 
+    // destination port 0 is reserved
     assign port_error_now = (cursor == 4'd3) && data_valid
                           && field_zero && (data == 8'h00);
 
+    // zero checksum field means the sender skipped it
+    // odd payload pads low with zero so the sum is already done
     assign checksum_skip_now = field_zero
                              && ((cursor != 4'd7) || (data == 8'h00));
     assign checksum_error_now = payload_complete_now && !checksum_skip_now
@@ -174,18 +181,19 @@ module udp_parser #(
                                 && (cursor != CURSOR_DROP)
                                 && !payload_complete_now;
     assign upstream_error_now = packet_context && data_error;
-    assign local_error_now = length_error_now || length_mismatch_now
-                           || port_error_now || checksum_error_now
-                           || truncation_error_now;
+    assign packet_error_now = length_error_now || length_mismatch_now
+                            || port_error_now || checksum_error_now
+                            || truncation_error_now || upstream_error_now;
 
+    // local errors stop later bytes
+    // data_error also kills the current byte
     assign output_abort = (cursor == CURSOR_DROP) || upstream_error_now;
 
     // packet signals
     assign start_of_packet = data_start && data_valid;
     assign end_of_packet = data_end && packet_context;
     assign udp_checksum_error = checksum_error_now;
-    assign udp_error = (cursor == CURSOR_DROP)
-                     || upstream_error_now || local_error_now;
+    assign udp_error = (cursor == CURSOR_DROP) || packet_error_now;
 
     // field windows line up with the current byte
     assign header_udp_valid = header_byte_active && !output_abort;
@@ -213,27 +221,24 @@ module udp_parser #(
             field_zero      <= 1'b0;
         end else begin
             if (cursor == CURSOR_IDLE) begin
-                cursor          <= CURSOR_IDLE;
                 bytes_remaining <= '0;
                 field_zero      <= 1'b0;
 
                 if (pseudo_valid) begin
+                    // source and destination ip in network order
                     checksum_sum <= checksum_next;
                     low_half     <= !low_half;
                 end
 
                 if (data_start && data_valid) begin
                     checksum_sum <= checksum_next;
-                    if (length_mismatch_now) begin
-                        cursor <= CURSOR_DROP;
-                    end else begin
-                        cursor <= 4'd1;
-                    end
+                    cursor       <= 4'd1;
                 end
             end else if (header_cursor_active) begin
                 if (data_valid) begin
                     checksum_sum <= checksum_next;
 
+                    // port high byte on 2 and checksum on 6-7
                     if ((cursor == 4'd2) || (cursor == 4'd6)) begin
                         field_zero <= (data == 8'h00);
                     end else if (cursor == 4'd7) begin
@@ -247,29 +252,22 @@ module udp_parser #(
                             bytes_remaining <= {data, 8'b0};
                             cursor <= 4'd5;
                         end
-                    end else if (cursor == CURSOR_LENGTH_BAD) begin
-                        cursor <= CURSOR_DROP;
                     end else if (cursor == 4'd5) begin
-                        if (length_error_now) begin
-                            cursor <= CURSOR_DROP;
+                        bytes_remaining <= length_candidate;
+                        cursor <= 4'd6;
+                    end else if (cursor == 4'd7) begin
+                        bytes_remaining <= bytes_remaining - 1'b1;
+                        if (bytes_remaining == TERMINAL_COUNT) begin
+                            cursor <= CURSOR_WAIT_END;
                         end else begin
-                            bytes_remaining <= length_candidate;
-                            cursor <= 4'd6;
+                            cursor <= CURSOR_PAYLOAD;
                         end
                     end else begin
-                        if (cursor >= 4'd6) begin
+                        if (cursor == 4'd6) begin
                             bytes_remaining <= bytes_remaining - 1'b1;
                         end
-
-                        if (cursor == 4'd7) begin
-                            if (bytes_remaining == TERMINAL_COUNT) begin
-                                cursor <= CURSOR_WAIT_END;
-                            end else begin
-                                cursor <= CURSOR_PAYLOAD;
-                            end
-                        end else begin
-                            cursor <= cursor + 1'b1;
-                        end
+                        // length bad only moves on through the error
+                        cursor <= cursor + 1'b1;
                     end
                 end
             end else if (cursor == CURSOR_PAYLOAD) begin
@@ -281,21 +279,23 @@ module udp_parser #(
                         cursor <= CURSOR_WAIT_END;
                     end
                 end
-            end else if (cursor == CURSOR_WAIT_END) begin
-                cursor <= CURSOR_WAIT_END;
-            end else begin
+            end else if (cursor != CURSOR_WAIT_END) begin
+                // drop and unused states fail closed
+                // wait end drains until the frame boundary
                 cursor <= CURSOR_DROP;
             end
 
-            if (local_error_now || upstream_error_now) begin
+            if (packet_error_now) begin
                 cursor <= CURSOR_DROP;
             end
 
+            // every frame boundary restarts the pseudo header sum
             if (data_end) begin
                 checksum_sum <= UDP_PROTOCOL;
                 low_half     <= 1'b0;
             end
 
+            // data_end wins so drop cannot stick
             if (data_end && packet_context) begin
                 cursor          <= CURSOR_IDLE;
                 bytes_remaining <= '0;
