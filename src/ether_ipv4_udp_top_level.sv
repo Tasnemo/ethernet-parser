@@ -65,6 +65,23 @@ module full_parser #(
     logic udp_data_error;
     logic udp_pseudo_valid;
 
+    // udp stage
+    logic [7:0] udp_stream;
+    logic udp_header_valid;
+    logic udp_source_port_valid;
+    logic udp_destination_port_valid;
+    logic udp_length_valid;
+    logic udp_checksum_valid;
+    logic udp_payload_valid;
+    logic udp_start_of_packet;
+    logic udp_end_of_payload;
+    logic udp_end_of_packet;
+    logic udp_checksum_error;
+    logic udp_error;
+
+    // first payload byte seen
+    logic payload_started;
+
     ethernet_parser ethernet (
         .rx_clk(rx_clk),
         .rst(rst),
@@ -85,20 +102,22 @@ module full_parser #(
     // routing and start flags reset every frame
     always_ff @(posedge rx_clk) begin
         if (rst) begin
-            ethertype_high <= '0;
-            ethertype_half <= 1'b0;
-            route_ipv4     <= 1'b0;
-            ipv4_started   <= 1'b0;
-            route_udp      <= 1'b0;
-            udp_started    <= 1'b0;
+            ethertype_high  <= '0;
+            ethertype_half  <= 1'b0;
+            route_ipv4      <= 1'b0;
+            ipv4_started    <= 1'b0;
+            route_udp       <= 1'b0;
+            udp_started     <= 1'b0;
+            payload_started <= 1'b0;
         end else begin
             if (ether_start_of_packet) begin
-                ethertype_high <= '0;
-                ethertype_half <= 1'b0;
-                route_ipv4     <= 1'b0;
-                ipv4_started   <= 1'b0;
-                route_udp      <= 1'b0;
-                udp_started    <= 1'b0;
+                ethertype_high  <= '0;
+                ethertype_half  <= 1'b0;
+                route_ipv4      <= 1'b0;
+                ipv4_started    <= 1'b0;
+                route_udp       <= 1'b0;
+                udp_started     <= 1'b0;
+                payload_started <= 1'b0;
             end
 
             // ethertype is big endian and finishes one cycle before payload
@@ -125,12 +144,17 @@ module full_parser #(
                 udp_started <= 1'b1;
             end
 
+            if (parser_start) begin
+                payload_started <= 1'b1;
+            end
+
             if (ether_end_of_packet) begin
-                ethertype_half <= 1'b0;
-                route_ipv4     <= 1'b0;
-                ipv4_started   <= 1'b0;
-                route_udp      <= 1'b0;
-                udp_started    <= 1'b0;
+                ethertype_half  <= 1'b0;
+                route_ipv4      <= 1'b0;
+                ipv4_started    <= 1'b0;
+                route_udp       <= 1'b0;
+                udp_started     <= 1'b0;
+                payload_started <= 1'b0;
             end
         end
     end
@@ -176,11 +200,38 @@ module full_parser #(
     assign udp_pseudo_valid = (ipv4_source_ip_valid || ipv4_destination_ip_valid)
                             && route_udp;
 
-    // udp segments only out
-    assign parser       = ipv4_stream;
-    assign parser_valid = udp_data_valid;
-    assign parser_start = udp_data_start;
-    assign parser_last  = udp_data_last;
-    assign parser_error = ether_error || ipv4_error;
+    udp_parser #(
+        .MAX_UDP_BYTES(MAX_IPV4_BYTES - 20)
+    ) udp (
+        .clk(rx_clk),
+        .rst(rst),
+        .data(ipv4_stream),
+        .data_valid(udp_data_valid),
+        .data_start(udp_data_start),
+        .data_last(udp_data_last),
+        .data_end(udp_data_end),
+        .data_error(udp_data_error),
+        .pseudo_valid(udp_pseudo_valid),
+        .o_stream(udp_stream),
+        .header_udp_valid(udp_header_valid),
+        .source_port_valid(udp_source_port_valid),
+        .destination_port_valid(udp_destination_port_valid),
+        .length_valid(udp_length_valid),
+        .checksum_valid(udp_checksum_valid),
+        .payload_udp_valid(udp_payload_valid),
+        .start_of_packet(udp_start_of_packet),
+        .end_of_payload(udp_end_of_payload),
+        .end_of_packet(udp_end_of_packet),
+        .udp_checksum_error(udp_checksum_error),
+        .udp_error(udp_error)
+    );
+
+    // udp payload out with datagram framing
+    assign parser       = udp_stream;
+    assign parser_valid = udp_payload_valid;
+    assign parser_start = udp_payload_valid && !payload_started;
+    // udp length marks the last payload byte
+    assign parser_last  = udp_end_of_payload && udp_payload_valid;
+    assign parser_error = ether_error || ipv4_error || udp_error;
 
 endmodule
