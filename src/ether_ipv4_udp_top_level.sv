@@ -54,8 +54,16 @@ module full_parser #(
     logic ipv4_checksum_error;
     logic ipv4_error;
 
-    // first payload byte seen
-    logic payload_started;
+    // udp routing
+    logic route_udp;
+    logic udp_started;
+
+    logic udp_data_valid;
+    logic udp_data_start;
+    logic udp_data_last;
+    logic udp_data_end;
+    logic udp_data_error;
+    logic udp_pseudo_valid;
 
     ethernet_parser ethernet (
         .rx_clk(rx_clk),
@@ -77,18 +85,20 @@ module full_parser #(
     // routing and start flags reset every frame
     always_ff @(posedge rx_clk) begin
         if (rst) begin
-            ethertype_high  <= '0;
-            ethertype_half  <= 1'b0;
-            route_ipv4      <= 1'b0;
-            ipv4_started    <= 1'b0;
-            payload_started <= 1'b0;
+            ethertype_high <= '0;
+            ethertype_half <= 1'b0;
+            route_ipv4     <= 1'b0;
+            ipv4_started   <= 1'b0;
+            route_udp      <= 1'b0;
+            udp_started    <= 1'b0;
         end else begin
             if (ether_start_of_packet) begin
-                ethertype_high  <= '0;
-                ethertype_half  <= 1'b0;
-                route_ipv4      <= 1'b0;
-                ipv4_started    <= 1'b0;
-                payload_started <= 1'b0;
+                ethertype_high <= '0;
+                ethertype_half <= 1'b0;
+                route_ipv4     <= 1'b0;
+                ipv4_started   <= 1'b0;
+                route_udp      <= 1'b0;
+                udp_started    <= 1'b0;
             end
 
             // ethertype is big endian and finishes one cycle before payload
@@ -102,19 +112,25 @@ module full_parser #(
                 end
             end
 
+            // protocol on byte 9 lands before the ip addresses
+            if (ipv4_protocol_valid) begin
+                route_udp <= (ipv4_stream == 8'd17);
+            end
+
             if (ipv4_data_start) begin
                 ipv4_started <= 1'b1;
             end
 
-            if (parser_start) begin
-                payload_started <= 1'b1;
+            if (udp_data_start) begin
+                udp_started <= 1'b1;
             end
 
             if (ether_end_of_packet) begin
-                ethertype_half  <= 1'b0;
-                route_ipv4      <= 1'b0;
-                ipv4_started    <= 1'b0;
-                payload_started <= 1'b0;
+                ethertype_half <= 1'b0;
+                route_ipv4     <= 1'b0;
+                ipv4_started   <= 1'b0;
+                route_udp      <= 1'b0;
+                udp_started    <= 1'b0;
             end
         end
     end
@@ -149,12 +165,22 @@ module full_parser #(
         .ipv4_error(ipv4_error)
     );
 
-    // ipv4 payload out with ethernet padding dropped
+    // udp segment is the ipv4 payload of a protocol 17 packet
+    assign udp_data_valid   = ipv4_payload_valid && route_udp;
+    assign udp_data_start   = udp_data_valid && !udp_started;
+    // total length marks the last segment byte
+    assign udp_data_last    = ipv4_end_of_payload && udp_data_valid;
+    assign udp_data_end     = ipv4_end_of_packet && route_udp;
+    assign udp_data_error   = ipv4_error && route_udp;
+    // ip addresses feed the pseudo header before the segment starts
+    assign udp_pseudo_valid = (ipv4_source_ip_valid || ipv4_destination_ip_valid)
+                            && route_udp;
+
+    // udp segments only out
     assign parser       = ipv4_stream;
-    assign parser_valid = ipv4_payload_valid;
-    assign parser_start = ipv4_payload_valid && !payload_started;
-    // total length marks the last payload byte
-    assign parser_last  = ipv4_end_of_payload && ipv4_payload_valid;
+    assign parser_valid = udp_data_valid;
+    assign parser_start = udp_data_start;
+    assign parser_last  = udp_data_last;
     assign parser_error = ether_error || ipv4_error;
 
 endmodule
