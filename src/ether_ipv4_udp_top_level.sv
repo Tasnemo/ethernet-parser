@@ -29,8 +29,16 @@ module full_parser #(
     logic ether_fcs_error;
     logic ether_error;
 
-    // first payload byte seen
-    logic ether_started;
+    // ipv4 routing
+    logic [7:0] ethertype_high;
+    logic ethertype_half;
+    logic route_ipv4;
+    logic ipv4_started;
+
+    logic ipv4_data_valid;
+    logic ipv4_data_start;
+    logic ipv4_data_end;
+    logic ipv4_data_error;
 
     ethernet_parser ethernet (
         .rx_clk(rx_clk),
@@ -49,29 +57,54 @@ module full_parser #(
         .ether_error(ether_error)
     );
 
-    // start flag resets every frame
+    // routing and start flags reset every frame
     always_ff @(posedge rx_clk) begin
         if (rst) begin
-            ether_started <= 1'b0;
+            ethertype_high <= '0;
+            ethertype_half <= 1'b0;
+            route_ipv4     <= 1'b0;
+            ipv4_started   <= 1'b0;
         end else begin
             if (ether_start_of_packet) begin
-                ether_started <= 1'b0;
+                ethertype_high <= '0;
+                ethertype_half <= 1'b0;
+                route_ipv4     <= 1'b0;
+                ipv4_started   <= 1'b0;
             end
 
-            if (parser_start) begin
-                ether_started <= 1'b1;
+            // ethertype is big endian and finishes one cycle before payload
+            if (ether_ethertype_valid) begin
+                if (!ethertype_half) begin
+                    ethertype_high <= ether_stream;
+                    ethertype_half <= 1'b1;
+                end else begin
+                    route_ipv4     <= ({ethertype_high, ether_stream} == 16'h0800);
+                    ethertype_half <= 1'b0;
+                end
+            end
+
+            if (ipv4_data_start) begin
+                ipv4_started <= 1'b1;
             end
 
             if (ether_end_of_packet) begin
-                ether_started <= 1'b0;
+                ethertype_half <= 1'b0;
+                route_ipv4     <= 1'b0;
+                ipv4_started   <= 1'b0;
             end
         end
     end
 
-    // ethernet payload out with fcs already stripped
+    // ipv4 packet is the ethernet payload of an 0x0800 frame
+    assign ipv4_data_valid = ether_payload_valid && route_ipv4;
+    assign ipv4_data_start = ipv4_data_valid && !ipv4_started;
+    assign ipv4_data_end   = ether_end_of_packet && route_ipv4;
+    assign ipv4_data_error = ether_error && route_ipv4;
+
+    // ipv4 frames only out
     assign parser       = ether_stream;
-    assign parser_valid = ether_payload_valid;
-    assign parser_start = ether_payload_valid && !ether_started;
+    assign parser_valid = ipv4_data_valid;
+    assign parser_start = ipv4_data_start;
     // payload length is unknown until the ipv4 stage
     assign parser_last  = 1'b0;
     assign parser_error = ether_error;
