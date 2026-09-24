@@ -40,6 +40,23 @@ module full_parser #(
     logic ipv4_data_end;
     logic ipv4_data_error;
 
+    // ipv4 stage
+    logic [7:0] ipv4_stream;
+    logic ipv4_header_valid;
+    logic ipv4_total_length_valid;
+    logic ipv4_protocol_valid;
+    logic ipv4_source_ip_valid;
+    logic ipv4_destination_ip_valid;
+    logic ipv4_payload_valid;
+    logic ipv4_start_of_packet;
+    logic ipv4_end_of_payload;
+    logic ipv4_end_of_packet;
+    logic ipv4_checksum_error;
+    logic ipv4_error;
+
+    // first payload byte seen
+    logic payload_started;
+
     ethernet_parser ethernet (
         .rx_clk(rx_clk),
         .rst(rst),
@@ -60,16 +77,18 @@ module full_parser #(
     // routing and start flags reset every frame
     always_ff @(posedge rx_clk) begin
         if (rst) begin
-            ethertype_high <= '0;
-            ethertype_half <= 1'b0;
-            route_ipv4     <= 1'b0;
-            ipv4_started   <= 1'b0;
+            ethertype_high  <= '0;
+            ethertype_half  <= 1'b0;
+            route_ipv4      <= 1'b0;
+            ipv4_started    <= 1'b0;
+            payload_started <= 1'b0;
         end else begin
             if (ether_start_of_packet) begin
-                ethertype_high <= '0;
-                ethertype_half <= 1'b0;
-                route_ipv4     <= 1'b0;
-                ipv4_started   <= 1'b0;
+                ethertype_high  <= '0;
+                ethertype_half  <= 1'b0;
+                route_ipv4      <= 1'b0;
+                ipv4_started    <= 1'b0;
+                payload_started <= 1'b0;
             end
 
             // ethertype is big endian and finishes one cycle before payload
@@ -87,10 +106,15 @@ module full_parser #(
                 ipv4_started <= 1'b1;
             end
 
+            if (parser_start) begin
+                payload_started <= 1'b1;
+            end
+
             if (ether_end_of_packet) begin
-                ethertype_half <= 1'b0;
-                route_ipv4     <= 1'b0;
-                ipv4_started   <= 1'b0;
+                ethertype_half  <= 1'b0;
+                route_ipv4      <= 1'b0;
+                ipv4_started    <= 1'b0;
+                payload_started <= 1'b0;
             end
         end
     end
@@ -101,12 +125,36 @@ module full_parser #(
     assign ipv4_data_end   = ether_end_of_packet && route_ipv4;
     assign ipv4_data_error = ether_error && route_ipv4;
 
-    // ipv4 frames only out
-    assign parser       = ether_stream;
-    assign parser_valid = ipv4_data_valid;
-    assign parser_start = ipv4_data_start;
-    // payload length is unknown until the ipv4 stage
-    assign parser_last  = 1'b0;
-    assign parser_error = ether_error;
+    ipv4_parser #(
+        .MAX_IPV4_BYTES(MAX_IPV4_BYTES)
+    ) ipv4 (
+        .clk(rx_clk),
+        .rst(rst),
+        .data(ether_stream),
+        .data_valid(ipv4_data_valid),
+        .data_start(ipv4_data_start),
+        .data_end(ipv4_data_end),
+        .data_error(ipv4_data_error),
+        .o_stream(ipv4_stream),
+        .header_ipv4_valid(ipv4_header_valid),
+        .total_length_valid(ipv4_total_length_valid),
+        .protocol_valid(ipv4_protocol_valid),
+        .source_ip_valid(ipv4_source_ip_valid),
+        .destination_ip_valid(ipv4_destination_ip_valid),
+        .payload_ipv4_valid(ipv4_payload_valid),
+        .start_of_packet(ipv4_start_of_packet),
+        .end_of_payload(ipv4_end_of_payload),
+        .end_of_packet(ipv4_end_of_packet),
+        .header_checksum_error(ipv4_checksum_error),
+        .ipv4_error(ipv4_error)
+    );
+
+    // ipv4 payload out with ethernet padding dropped
+    assign parser       = ipv4_stream;
+    assign parser_valid = ipv4_payload_valid;
+    assign parser_start = ipv4_payload_valid && !payload_started;
+    // total length marks the last payload byte
+    assign parser_last  = ipv4_end_of_payload && ipv4_payload_valid;
+    assign parser_error = ether_error || ipv4_error;
 
 endmodule
