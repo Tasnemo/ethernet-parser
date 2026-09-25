@@ -56,4 +56,99 @@ package gmii_pkg;
         endfunction
     endclass
 
+    typedef uvm_sequencer #(eth_frame_item) gmii_sequencer;
+
+    class gmii_driver extends uvm_driver #(eth_frame_item);
+        `uvm_component_utils(gmii_driver)
+
+        virtual gmii_if vif;
+
+        function new(string name, uvm_component parent);
+            super.new(name, parent);
+        endfunction
+
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            if (!uvm_config_db #(virtual gmii_if)::get(this, "", "vif", vif)) begin
+                `uvm_fatal("NOVIF", "gmii_if not set")
+            end
+        endfunction
+
+        task run_phase(uvm_phase phase);
+            vif.drv_cb.rxd   <= '0;
+            vif.drv_cb.rx_dv <= 1'b0;
+            vif.drv_cb.rx_er <= 1'b0;
+            wait (vif.rst === 1'b0);
+            repeat (4) @(vif.drv_cb);
+            forever begin
+                seq_item_port.get_next_item(req);
+                drive(req);
+                seq_item_port.item_done();
+            end
+        endtask
+
+        task drive(eth_frame_item t);
+            bytes_t b = t.frame_bytes();
+            int n = b.size();
+            if (t.truncate_at >= 0 && t.truncate_at < n) n = t.truncate_at;
+            `uvm_info("DRV", t.convert2string(), UVM_HIGH)
+            for (int i = 0; i < n; i++) begin
+                @(vif.drv_cb);
+                vif.drv_cb.rxd   <= b[i];
+                vif.drv_cb.rx_dv <= 1'b1;
+                vif.drv_cb.rx_er <= (i == t.rx_er_at);
+            end
+        endtask
+    endclass
+
+    class gmii_agent extends uvm_agent;
+        `uvm_component_utils(gmii_agent)
+
+        gmii_sequencer sqr;
+        gmii_driver drv;
+
+        function new(string name, uvm_component parent);
+            super.new(name, parent);
+        endfunction
+
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            if (get_is_active() == UVM_ACTIVE) begin
+                sqr = gmii_sequencer::type_id::create("sqr", this);
+                drv = gmii_driver::type_id::create("drv", this);
+            end
+        endfunction
+
+        function void connect_phase(uvm_phase phase);
+            if (get_is_active() == UVM_ACTIVE) begin
+                drv.seq_item_port.connect(sqr.seq_item_export);
+            end
+        endfunction
+    endclass
+
+    // count random frames, subclasses shape each one
+    class gmii_base_seq extends uvm_sequence #(eth_frame_item);
+        `uvm_object_utils(gmii_base_seq)
+
+        int unsigned count = 10;
+
+        function new(string name = "gmii_base_seq");
+            super.new(name);
+        endfunction
+
+        virtual function void shape(eth_frame_item t, int unsigned i);
+            if (!t.randomize()) `uvm_fatal("RAND", "frame randomize failed")
+        endfunction
+
+        task body();
+            eth_frame_item t;
+            for (int unsigned i = 0; i < count; i++) begin
+                t = eth_frame_item::type_id::create($sformatf("frame%0d", i));
+                start_item(t);
+                shape(t, i);
+                finish_item(t);
+            end
+        endtask
+    endclass
+
 endpackage

@@ -4,6 +4,36 @@ package eth_env_pkg;
     import tb_utils_pkg::*;
     import gmii_pkg::*;
 
+
+    class eth_env extends uvm_env;
+        `uvm_component_utils(eth_env)
+
+        gmii_agent agent;
+
+        function new(string name, uvm_component parent);
+            super.new(name, parent);
+        endfunction
+
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            agent = gmii_agent::type_id::create("agent", this);
+        endfunction
+    endclass
+
+    // good frames clear of the runt limit, small payloads keep runs short
+    class eth_good_seq extends gmii_base_seq;
+        `uvm_object_utils(eth_good_seq)
+
+        function new(string name = "eth_good_seq");
+            super.new(name);
+        endfunction
+
+        function void shape(eth_frame_item t, int unsigned i);
+            if (!t.randomize() with { payload_len dist {[64:128] :/ 8, [129:1500] :/ 2}; })
+                `uvm_fatal("RAND", "frame randomize failed")
+        endfunction
+    endclass
+
     // toolchain and wiring check, no dut traffic
     class hello_test extends uvm_test;
         `uvm_component_utils(hello_test)
@@ -33,27 +63,44 @@ package eth_env_pkg;
             phase.drop_objection(this);
         endtask
     endclass
-    // randomizes a few frames and checks the fcs they carry
-    class item_test extends uvm_test;
-        `uvm_component_utils(item_test)
+
+    // builds the env and runs whatever sequence the subclass picks
+    class eth_base_test extends uvm_test;
+        `uvm_component_utils(eth_base_test)
+
+        eth_env env;
 
         function new(string name, uvm_component parent);
             super.new(name, parent);
         endfunction
 
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            env = eth_env::type_id::create("env", this);
+        endfunction
+
+        virtual function gmii_base_seq make_seq();
+            eth_good_seq s = eth_good_seq::type_id::create("seq");
+            return s;
+        endfunction
+
         task run_phase(uvm_phase phase);
-            eth_frame_item t;
-            bytes_t b;
+            gmii_base_seq s;
             phase.raise_objection(this);
-            repeat (5) begin
-                t = eth_frame_item::type_id::create("t");
-                if (!t.randomize() with { payload_len inside {[46:64]}; })
-                    `uvm_fatal("RAND", "frame randomize failed")
-                b = t.frame_bytes();
-                `uvm_info("ITEM", $sformatf("%s fcs_ok %0b: %s", t.convert2string(),
-                          fcs_ok(b), hex(b, 24)), UVM_LOW)
-            end
+            s = make_seq();
+            s.start(env.agent.sqr);
+            // let the last frame drain through the parser
+            #1us;
             phase.drop_objection(this);
         endtask
     endclass
+
+    class eth_smoke_test extends eth_base_test;
+        `uvm_component_utils(eth_smoke_test)
+
+        function new(string name, uvm_component parent);
+            super.new(name, parent);
+        endfunction
+    endclass
+
 endpackage
