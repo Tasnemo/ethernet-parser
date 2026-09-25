@@ -56,6 +56,22 @@ package gmii_pkg;
         endfunction
     endclass
 
+    // what the input monitor saw on the pins
+    class gmii_obs_item extends uvm_sequence_item;
+        `uvm_object_utils(gmii_obs_item)
+
+        bytes_t bytes;
+        bit rx_er;
+
+        function new(string name = "gmii_obs_item");
+            super.new(name);
+        endfunction
+
+        function string convert2string();
+            return $sformatf("%0d bytes rx_er %0b: %s", bytes.size(), rx_er, hex(bytes));
+        endfunction
+    endclass
+
     typedef uvm_sequencer #(eth_frame_item) gmii_sequencer;
 
     class gmii_driver extends uvm_driver #(eth_frame_item);
@@ -98,6 +114,50 @@ package gmii_pkg;
                 vif.drv_cb.rx_dv <= 1'b1;
                 vif.drv_cb.rx_er <= (i == t.rx_er_at);
             end
+            // rx_dv low marks the end of the frame
+            @(vif.drv_cb);
+            vif.drv_cb.rxd   <= '0;
+            vif.drv_cb.rx_dv <= 1'b0;
+            vif.drv_cb.rx_er <= 1'b0;
+            repeat (t.gap) @(vif.drv_cb);
+        endtask
+    endclass
+
+    // rebuilds each frame from rx_dv high to rx_dv low
+    class gmii_monitor extends uvm_monitor;
+        `uvm_component_utils(gmii_monitor)
+
+        virtual gmii_if vif;
+        uvm_analysis_port #(gmii_obs_item) ap;
+
+        function new(string name, uvm_component parent);
+            super.new(name, parent);
+        endfunction
+
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            ap = new("ap", this);
+            if (!uvm_config_db #(virtual gmii_if)::get(this, "", "vif", vif)) begin
+                `uvm_fatal("NOVIF", "gmii_if not set")
+            end
+        endfunction
+
+        task run_phase(uvm_phase phase);
+            gmii_obs_item t;
+            forever begin
+                @(vif.mon_cb);
+                if (vif.mon_cb.rst) begin
+                    t = null;
+                end else if (vif.mon_cb.rx_dv) begin
+                    if (t == null) t = gmii_obs_item::type_id::create("t");
+                    t.bytes.push_back(vif.mon_cb.rxd);
+                    if (vif.mon_cb.rx_er) t.rx_er = 1;
+                end else if (t != null) begin
+                    `uvm_info("MON", t.convert2string(), UVM_MEDIUM)
+                    ap.write(t);
+                    t = null;
+                end
+            end
         endtask
     endclass
 
@@ -106,6 +166,7 @@ package gmii_pkg;
 
         gmii_sequencer sqr;
         gmii_driver drv;
+        gmii_monitor mon;
 
         function new(string name, uvm_component parent);
             super.new(name, parent);
@@ -113,6 +174,7 @@ package gmii_pkg;
 
         function void build_phase(uvm_phase phase);
             super.build_phase(phase);
+            mon = gmii_monitor::type_id::create("mon", this);
             if (get_is_active() == UVM_ACTIVE) begin
                 sqr = gmii_sequencer::type_id::create("sqr", this);
                 drv = gmii_driver::type_id::create("drv", this);

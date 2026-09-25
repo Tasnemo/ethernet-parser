@@ -5,10 +5,28 @@ package eth_env_pkg;
     import gmii_pkg::*;
 
 
-    class eth_env extends uvm_env;
-        `uvm_component_utils(eth_env)
+    // what the parser put out for one frame
+    class eth_out_item extends uvm_sequence_item;
+        `uvm_object_utils(eth_out_item)
 
-        gmii_agent agent;
+        bytes_t bytes;
+        bit error;
+        bit fcs_error;
+
+        function new(string name = "eth_out_item");
+            super.new(name);
+        endfunction
+
+        function string convert2string();
+            return $sformatf("err %0b fcs_err %0b %s", error, fcs_error, hex(bytes));
+        endfunction
+    endclass
+    // collects payload bytes and takes the verdict on end_of_packet
+    class eth_out_monitor extends uvm_monitor;
+        `uvm_component_utils(eth_out_monitor)
+
+        virtual eth_out_if vif;
+        uvm_analysis_port #(eth_out_item) ap;
 
         function new(string name, uvm_component parent);
             super.new(name, parent);
@@ -16,7 +34,44 @@ package eth_env_pkg;
 
         function void build_phase(uvm_phase phase);
             super.build_phase(phase);
-            agent = gmii_agent::type_id::create("agent", this);
+            ap = new("ap", this);
+            if (!uvm_config_db #(virtual eth_out_if)::get(this, "", "vif", vif)) begin
+                `uvm_fatal("NOVIF", "eth_out_if not set")
+            end
+        endfunction
+
+        task run_phase(uvm_phase phase);
+            eth_out_item t;
+            bytes_t bytes;
+            forever begin
+                @(vif.mon_cb);
+                if (vif.mon_cb.payload_ether_valid) bytes.push_back(vif.mon_cb.o_stream);
+                if (vif.mon_cb.end_of_packet) begin
+                    t = eth_out_item::type_id::create("t");
+                    t.bytes     = bytes;
+                    t.error     = vif.mon_cb.ether_error;
+                    t.fcs_error = vif.mon_cb.fcs_error;
+                    `uvm_info("OUTMON", t.convert2string(), UVM_MEDIUM)
+                    ap.write(t);
+                end
+            end
+        endtask
+    endclass
+
+    class eth_env extends uvm_env;
+        `uvm_component_utils(eth_env)
+
+        gmii_agent agent;
+        eth_out_monitor out_mon;
+
+        function new(string name, uvm_component parent);
+            super.new(name, parent);
+        endfunction
+
+        function void build_phase(uvm_phase phase);
+            super.build_phase(phase);
+            agent   = gmii_agent::type_id::create("agent", this);
+            out_mon = eth_out_monitor::type_id::create("out_mon", this);
         endfunction
     endclass
 
