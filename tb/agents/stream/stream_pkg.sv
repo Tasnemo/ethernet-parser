@@ -114,8 +114,12 @@ package stream_pkg;
                 vif.drv_cb.data_error <= (i == t.error_at);
             end
 
+            // data_end lands a cycle after the last byte like ethernet end_of_packet
             @(vif.drv_cb);
             idle();
+            vif.drv_cb.data_end <= 1'b1;
+            @(vif.drv_cb);
+            vif.drv_cb.data_end <= 1'b0;
             repeat (t.gap) @(vif.drv_cb);
         endtask
     endclass
