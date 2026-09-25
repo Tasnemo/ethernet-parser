@@ -76,7 +76,7 @@ package tb_utils_pkg;
         buffer.push_back(8'(seg.size()));
         foreach (seg[i]) buffer.push_back(seg[i]);
         if (buffer.size() % 2) begin
-            buffer.insert(buffer.size() - 1, 8'h00);
+            buffer.push_back(8'h00);
         end
         return ones_sum(buffer);
     endfunction
