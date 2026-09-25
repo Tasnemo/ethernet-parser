@@ -108,7 +108,7 @@ package eth_env_pkg;
 
             // no fcs compare on a runt or an over length frame
             e.fcs_error = (count >= MIN_COUNT) && (count <= MAX_COUNT) && !fcs_ok(b);
-            e.error = rx_er || (count - 4 < MIN_COUNT) || (count > MAX_COUNT) || e.fcs_error;
+            e.error = rx_er || (count < MIN_COUNT) || (count > MAX_COUNT) || e.fcs_error;
 
             // payload is capped and the last 4 bytes stay in the fcs pipe
             keep = count - 4;
