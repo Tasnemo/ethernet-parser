@@ -225,8 +225,8 @@ package ipv4_env_pkg;
             total = be16(b, 2);
             header_bad = (b[0] != 8'h45)
                        || (total < 20) || (total > MAX_IPV4_BYTES)
-                       // no reassembly so any flag or offset means a fragment
-                       || (b[6][7:5] != 0) || (b[6][4:0] != 0) || (b[7] != 0);
+                       // no reassembly so df is fine but reserved, mf, or an offset is not
+                       || b[6][7] || b[6][5] || (b[6][4:0] != 0) || (b[7] != 0);
             checksum_bad = ones_sum(b[0:19]) != 16'hFFFF;
 
             e.error = header_bad || checksum_bad || err || (n < total);

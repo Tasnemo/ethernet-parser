@@ -67,6 +67,20 @@ package tb_utils_pkg;
         return s[15:0];
     endfunction
 
+    // udp sum covers the pseudo header, protocol, length, and segment
+    function automatic bit [15:0] udp_sum(bytes_t pseudo, bytes_t seg);
+        bytes_t buffer = pseudo;
+        buffer.push_back(8'h00);
+        buffer.push_back(8'h11);
+        buffer.push_back(8'(seg.size() >> 8));
+        buffer.push_back(8'(seg.size()));
+        foreach (seg[i]) buffer.push_back(seg[i]);
+        if (buffer.size() % 2) begin
+            buffer.insert(buffer.size() - 1, 8'h00);
+        end
+        return ones_sum(buffer);
+    endfunction
+
     function automatic string hex(bytes_t data, int limit = 16);
         string s = "";
         foreach (data[i]) begin

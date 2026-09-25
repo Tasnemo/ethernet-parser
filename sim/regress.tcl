@@ -5,7 +5,8 @@ source -notrace [file join [file dirname [info script]] sim_lib.tcl]
 
 set regress_tests [dict create \
     ethernet {eth_smoke_test eth_error_test eth_boundary_test eth_back_to_back_test eth_random_test} \
-    ipv4     {ipv4_smoke_test ipv4_error_test ipv4_stream_error_test ipv4_stall_test ipv4_random_test}]
+    ipv4     {ipv4_smoke_test ipv4_error_test ipv4_stream_error_test ipv4_stall_test ipv4_random_test} \
+    udp      {udp_smoke_test udp_error_test udp_stream_error_test udp_stall_test udp_random_test}]
 
 set which all
 set seeds {1 2 3}
