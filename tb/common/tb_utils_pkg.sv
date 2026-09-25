@@ -34,6 +34,39 @@ package tb_utils_pkg;
         return crc32(body) == rx;
     endfunction
 
+    // big endian fields, widths kept exact for xsim
+    function automatic bit [15:0] be16(bytes_t data, int i);
+        bit [7:0] hi = data[i];
+        bit [7:0] lo = data[i+1];
+        bit [15:0] v = {hi, lo};
+        return v;
+    endfunction
+
+    function automatic bit [31:0] be32(bytes_t data, int i);
+        bit [15:0] hi = be16(data, i);
+        bit [15:0] lo = be16(data, i + 2);
+        bit [31:0] v = {hi, lo};
+        return v;
+    endfunction
+
+    // ones complement sum of big endian words, odd byte pads low
+    function automatic bit [15:0] ones_sum(bytes_t data);
+        bit [31:0] s = 0;
+        bit [7:0] hi;
+        bit [7:0] lo;
+        bit [15:0] w;
+        for (int i = 0; i < data.size(); i += 2) begin
+            hi = data[i];
+            lo = (i + 1 < data.size()) ? data[i+1] : 8'h00;
+            w = {hi, lo};
+            s += w;
+        end
+        while (s[31:16] != 0) begin
+            s = s[15:0] + s[31:16];
+        end
+        return s[15:0];
+    endfunction
+
     function automatic string hex(bytes_t data, int limit = 16);
         string s = "";
         foreach (data[i]) begin
