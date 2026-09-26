@@ -70,5 +70,12 @@ foreach bench $benches {
 }
 
 puts ""
+puts [format "%-6s %-9s %-24s %-5s %-6s %-6s %s" result bench test seed errors fatals coverage]
+foreach r $results {
+    lassign $r bench test seed errors fatals coverage
+    set verdict [expr {$errors == 0 && $fatals == 0 ? "PASS" : "FAIL"}]
+    puts [format "%-6s %-9s %-24s %-5s %-6s %-6s %s" $verdict $bench $test $seed $errors $fatals $coverage]
+}
+puts ""
 puts "[llength $results] runs, $failures failed"
 exit [expr {$failures == 0 ? 0 : 1}]
